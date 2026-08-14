@@ -1,0 +1,6 @@
+web/node_modules/
+bin/
+runtime/
+.env
+.DS_Store
+.cache/
