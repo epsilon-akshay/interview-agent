@@ -1,8 +1,13 @@
+Link to the video: https://www.loom.com/share/2cf22b705d72432eb778935e2026f100
+
 # Signal Interview
 
-Signal Interview is a local, automated coding-interview application built with Go, React, Monaco, tldraw, the OpenAI Agents SDK, Realtime speech-to-speech, and a separate Codex evaluation manager.
+Signal is an AI interview agent that adapts each interview to a candidate’s profile and the role.
 
-The interviewer presents a server-controlled problem, listens to the candidate, reviews changed code and whiteboard work, asks short rubric-driven questions, records evidence, and ends at a configurable time limit. Candidate code can run against browser-isolated checks. Afterward, an evaluation manager generates a structured report from the code, test results, whiteboard, and recorded evidence.
+It supports four ways of input and interaction:
+- Voice,
+- AI Chat (for implementation only, no planning)
+- Code editor, and a whiteboard. The AI follows the candidate’s work across these modes, asks relevant follow-up questions, and evaluates both the answer and the reasoning behind it. Unlike AI interviewers built around a fixed voice conversation, Signal supports different ways of thinking and solving problems within one interview.
 
 ## Features
 
