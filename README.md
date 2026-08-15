@@ -7,7 +7,10 @@ Signal is an AI interview agent that adapts each interview to a candidate’s pr
 It supports four ways of input and interaction:
 - Voice,
 - AI Chat (for implementation only, no planning)
-- Code editor, and a whiteboard. The AI follows the candidate’s work across these modes, asks relevant follow-up questions, and evaluates both the answer and the reasoning behind it. Unlike AI interviewers built around a fixed voice conversation, Signal supports different ways of thinking and solving problems within one interview.
+- Code editor
+- Whiteboard.
+
+The AI follows the candidate’s work across these modes, asks relevant follow-up questions, and evaluates both the answer and the reasoning behind it. Unlike AI interviewers built around a fixed voice conversation, Signal supports different ways of thinking and solving problems within one interview.
 
 ## Features
 
