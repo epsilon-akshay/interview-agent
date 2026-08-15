@@ -2,7 +2,7 @@
 
 ## 1. Product summary
 
-Signal Interview is an automated, timed coding interviewer. It combines a live voice interviewer, browser code editor, rubric-driven evidence collection, proactive code observation, and a structured post-interview evaluation.
+Signal Interview is an automated, timed coding interviewer. It combines a live voice interviewer, browser code editor, whiteboard, rubric-driven evidence collection, proactive workspace observation, and a structured post-interview evaluation.
 
 The product is intended for screening and hackathon demonstration. It supports human hiring decisions; it does not make an autonomous employment decision.
 
@@ -22,14 +22,14 @@ Signal Interview standardizes this workflow while preserving an interactive conv
 
 - Conduct a complete local video and voice coding interview.
 - Ask only problem- and rubric-relevant questions.
-- Proactively inspect meaningful code changes without waiting for the candidate.
+- Proactively inspect meaningful code and whiteboard changes without waiting for the candidate.
 - Keep interviewer speech terse, demanding, and non-coaching.
 - Produce a readable, evidence-backed final rubric report.
-- Clearly disclose that code correctness was not runtime-tested.
+- Separate verified browser test results from model judgment.
 
 ## 5. Non-goals
 
-- Compiling, executing, or sandboxing candidate code.
+- Production-grade sandboxing of untrusted candidate code.
 - Automated hiring or rejection without human review.
 - Judging appearance, accent, personality, emotion, or protected traits.
 - Providing tutoring, hints, solutions, or model answers.
@@ -51,11 +51,13 @@ The Coding Interviewer asks one short question at a time, normally under 12 word
 
 Questions must derive from the problem, current code, or rubric. Valid challenge techniques include asking for proof, requesting a counterexample, questioning an assumption, testing an invariant, or introducing a valid edge case. The interviewer must not state false facts, invent requirements, or deliberately deceive the candidate.
 
-### 6.4 Proactive code observation
+### 6.4 Candidate workspace and proactive review
 
-The browser checks the editor revision every five seconds. When the revision changed and the agent is listening, it sends a review trigger. The interviewer retrieves the exact code through its tool and asks one question only if the revision exposes an unexplained choice, likely defect, or missing rubric signal. Identical revisions and busy voice turns are skipped.
+The candidate can switch between a Monaco editor and a tldraw whiteboard without losing either artifact. The whiteboard supports text, shapes, arrows, and freehand drawing. Code can run against visible browser-isolated checks.
 
-This mechanism observes editor text, not video. Periodic screenshots are outside this version.
+Every 15 seconds, the browser checks code and whiteboard revisions. When either changed and the agent is listening, it sends exact code, a compact scene summary, and a bounded whiteboard PNG. The interviewer asks one question only when the change exposes an unexplained choice, contradiction, likely defect, or missing rubric signal. Unchanged revisions, active drawing, and busy agent turns are skipped.
+
+This mechanism observes only Monaco and tldraw artifacts. It does not capture video, browser chrome, or unrelated screen content.
 
 ### 6.5 Completion
 
@@ -63,7 +65,7 @@ At zero seconds, the frontend prevents duplicate timer handling, marks the sessi
 
 ### 6.6 Evaluation Manager
 
-After the voice session closes, the frontend sends the session ID, candidate metadata, problem, rubric, and final code to the backend. The backend loads session evidence and calls a Codex model through the Responses API with a strict JSON schema.
+After the voice session closes, the frontend sends candidate metadata, problem, rubric, final code, final whiteboard scene, scene summary, and PNG to the backend. The backend loads session evidence and calls a Codex model through the Responses API with a strict JSON schema.
 
 The report contains:
 
@@ -73,7 +75,7 @@ The report contains:
 - Per-category score, weight, supporting evidence, and evidence gaps
 - Strengths, risks, and assessment limitations
 
-Missing evidence lowers confidence and may result in `insufficient_evidence`. The report must always state that code was evaluated statically and was not executed.
+Missing evidence lowers confidence and may result in `insufficient_evidence`. The report treats browser test outcomes as verified when present. It treats other correctness claims as model judgment. An empty whiteboard causes no penalty unless the rubric requires diagramming.
 
 ## 7. Functional requirements
 
@@ -81,16 +83,18 @@ Missing evidence lowers confidence and may result in `insufficient_evidence`. Th
 |---|---|
 | FR-1 | Capture camera and microphone with browser permission. |
 | FR-2 | Display candidate video and record the local media stream. |
-| FR-3 | Provide a Monaco TypeScript editor with revision tracking. |
+| FR-3 | Provide a Monaco TypeScript editor with revision tracking and browser-isolated checks. |
 | FR-4 | Establish a Realtime speech-to-speech session using an ephemeral token. |
-| FR-5 | Load the question from `questions/default.txt` through a tool call. |
+| FR-5 | Load the question from `questions/default.json` through a tool call. |
 | FR-6 | Read the UI rubric through a tool call before substantive interviewing. |
-| FR-7 | Inspect current editor text through an explicit tool. |
+| FR-7 | Inspect current editor text, execution results, and whiteboard summary through explicit tools. |
 | FR-8 | Persist rubric evidence with category, observation, confidence, and revision. |
-| FR-9 | Poll for changed code every five seconds and avoid overlapping agent turns. |
+| FR-9 | Review changed code or whiteboard content every 15 seconds and avoid overlapping agent turns. |
 | FR-10 | Enforce a configurable timer and graceful terminal sequence. |
 | FR-11 | Generate and render a schema-validated final evaluation. |
 | FR-12 | Allow evaluation retry without repeating the interview. |
+| FR-13 | Preserve Code and Whiteboard tab content throughout an interview. |
+| FR-14 | Send a whiteboard PNG to live and final multimodal evaluation only when the board is non-empty. |
 
 ## 8. Interview policy
 
@@ -100,7 +104,7 @@ The interviewer must:
 - Ask one terse, precise question at a time.
 - Prefer evidence-seeking questions over explanations.
 - Record only observable technical evidence.
-- Distinguish static analysis from executed correctness.
+- Distinguish browser test evidence from model judgment.
 
 The interviewer must not:
 
@@ -126,7 +130,7 @@ Custom rubric text is supported. The Evaluation Manager must reflect configured 
 
 - 100% of substantive questions are traceable to the problem, code, or rubric in review samples.
 - Median interviewer utterance is one sentence and under 12 spoken words after introduction.
-- No overlapping periodic scan is initiated while the agent is speaking or thinking.
+- No overlapping workspace review starts while the agent is speaking or thinking.
 - Every completed session returns a report or a visible retryable error.
 - Every category score includes evidence or an explicit evidence gap.
 - Zero hints, solutions, or unsupported runtime-correctness claims in policy evaluations.
@@ -144,25 +148,28 @@ Custom rubric text is supported. The Evaluation Manager must reflect configured 
 
 - The Platform API key remains on the Go server; only an ephemeral Realtime secret reaches the browser.
 - Local recordings remain in browser memory until saved or discarded.
-- Runtime JSONL files contain private assessment data and must not be committed or publicly shared.
+- Runtime JSONL files and whiteboard artifacts contain private assessment data. They must not be committed or publicly shared.
+- Camera frames and unrelated screen content are excluded from model inputs.
 - Production deployment requires consent, retention controls, authentication, authorization, encryption, auditability, and applicable employment-law review.
 
 ## 13. Acceptance criteria
 
-1. Starting an interview audibly presents the text-file problem after all mandatory setup tools complete.
-2. Editing code causes a `get_current_code` review within approximately five seconds once the agent is idle.
-3. Unchanged code does not cause repeated scan prompts.
-4. Interviewer answers remain terse and never provide a hint or solution.
-5. Timer expiry produces one time-up announcement and one completion record.
-6. The finished screen renders overall and category scores with evidence and gaps.
-7. Evaluation failure presents a retry button and does not lose the recording link.
-8. The report includes the no-code-execution limitation.
+1. Starting an interview presents the server-controlled problem after all mandatory setup tools complete.
+2. Code and Whiteboard tabs preserve their content.
+3. Editing code or drawing causes a `get_current_workspace` review on the next eligible 15-second cycle.
+4. Unchanged workspace content does not cause repeated review prompts.
+5. Interviewer answers remain terse and never provide a hint or solution.
+6. Timer expiry produces one time-up announcement and one completion record.
+7. The finished screen renders overall and category scores with evidence and gaps.
+8. Evaluation failure presents a retry button and does not lose the recording link.
+9. Final evaluation receives the code, test evidence, whiteboard summary, and whiteboard PNG.
+10. An empty whiteboard causes no default penalty.
 
 ## 14. Future scope
 
 - Transcript capture and evidence links to exact utterances
 - Recruiter-managed question and rubric banks
-- Screenshot-triggered workspace observation with explicit consent
+- Shared or collaborative whiteboards
 - Persistent database storage and authenticated reviewer portal
 - Prompt-policy regression tests and calibrated evaluator benchmarks
 - Human score overrides and reviewer notes

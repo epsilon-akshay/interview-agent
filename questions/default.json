@@ -1,0 +1,17 @@
+{
+  "id": "first-non-repeating-character",
+  "language": "typescript",
+  "entryFunction": "firstNonRepeatingCharacter",
+  "prompt": "Implement a function `firstNonRepeatingCharacter` that receives a string and returns the index of the first character that appears exactly once. Return `-1` when every character repeats.\n\nExamples:\n- `\"leetcode\"` returns `0`\n- `\"loveleetcode\"` returns `2`\n- `\"aabb\"` returns `-1`\n\nAsk clarifying questions when requirements are ambiguous. Discuss the expected time and space complexity before finishing.",
+  "starterCode": "function firstNonRepeatingCharacter(input: string): number {\n  // Explain your approach while you work.\n\n  return -1;\n}",
+  "tests": [
+    { "args": ["leetcode"],     "expected": 0  },
+    { "args": ["loveleetcode"], "expected": 2  },
+    { "args": ["aabb"],         "expected": -1 },
+    { "args": ["abcabd"],       "expected": 2  }
+  ],
+  "demo": {
+    "solution": "function firstNonRepeatingCharacter(input: string): number {\n  const counts = new Map<string, number>();\n  for (const character of input) {\n    counts.set(character, (counts.get(character) ?? 0) + 1);\n  }\n  for (let index = 0; index < input.length; index += 1) {\n    if (counts.get(input[index]) === 1) return index;\n  }\n  return -1;\n}",
+    "buggy": "function firstNonRepeatingCharacter(input: string): number {\n  for (let index = 0; index < input.length; index += 1) {\n    if (input[index] !== input[index + 1] && input[index] !== input[index - 1]) {\n      return index;\n    }\n  }\n  return -1;\n}"
+  }
+}

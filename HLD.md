@@ -4,7 +4,7 @@
 
 Signal Interview is an automated technical interview application that conducts a timed, voice-based coding interview. A candidate speaks with an OpenAI Realtime agent while writing code in a browser-based Monaco editor. The interviewer loads a server-controlled question and recruiter-defined rubric through tool calls, observes the candidate's current code, records assessment evidence, and ends the interview gracefully when the configured time expires.
 
-The current system performs model-assisted static assessment. It does not execute candidate code, so it must not claim that runtime correctness has been verified.
+The current system runs candidate code against browser-isolated checks. Test outcomes are verified artifacts. The model judges reasoning and any correctness claims outside those checks.
 
 ## 2. Goals
 
@@ -12,7 +12,7 @@ The current system performs model-assisted static assessment. It does not execut
 - Enforce a strict, assessment-only interview policy.
 - Load the question from a server-side text question bank.
 - Load the recruiter rubric from the configured UI textbox.
-- Observe the latest candidate code through an explicit agent tool.
+- Observe the latest candidate code and whiteboard through explicit agent tools.
 - Record evidence connected to rubric categories.
 - Support specialist interview phases using agent handoffs.
 - Provide a configurable interview duration, defaulting to five minutes.
@@ -22,7 +22,7 @@ The current system performs model-assisted static assessment. It does not execut
 
 ## 3. Non-goals
 
-- Executing or compiling candidate code.
+- Production-grade isolation for untrusted code execution.
 - Guaranteeing code correctness.
 - Supporting multiple programming languages in the initial version.
 - Detecting emotion, personality, confidence, gaze, or deception.
@@ -35,7 +35,7 @@ The current system performs model-assisted static assessment. It does not execut
 ```text
 ┌──────────────────────────────── Candidate browser ────────────────────────────────┐
 │                                                                                   │
-│  Camera/microphone   Monaco editor   Rubric/timer UI   Tool activity panel        │
+│  Camera/microphone   Monaco editor   tldraw board       Rubric/timer UI            │
 │          │                 │                │                  │                   │
 │          └─────────────────┴────────────────┴──────────────────┘                   │
 │                                      │                                            │
@@ -59,11 +59,13 @@ The current system performs model-assisted static assessment. It does not execut
 |---|---|---|
 | Frontend | React and TypeScript | Interview configuration and live interview experience |
 | Editor | Monaco Editor | Candidate code editing and revision tracking |
+| Whiteboard | tldraw | Candidate diagrams, labels, and visual reasoning |
+| Code runner | Web Worker | Browser-isolated checks and console capture |
 | Voice/agents | OpenAI Agents SDK | Realtime session, agents, tools, handoffs and tracing |
 | Media | Browser Media APIs | Camera preview, microphone access and local WebM recording |
 | Voice transport | WebRTC | Low-latency audio between browser and OpenAI Realtime |
 | Backend | Go standard library | Secure API boundary, static assets and local persistence |
-| Question bank | Text files | Server-controlled coding questions |
+| Question bank | JSON | Server-controlled prompt, starter code, checks, and demo fixtures |
 | Persistence | JSON Lines | Hackathon-stage evidence and completion event storage |
 
 ## 6. Logical components
@@ -87,6 +89,8 @@ Contains:
 - Current agent name
 - Server-fetched problem statement
 - Monaco TypeScript editor
+- tldraw whiteboard with persistent tab state
+- Code checks and console output
 - Candidate camera preview
 - Agent speaking/listening status
 - Agent tool-call activity
@@ -107,12 +111,16 @@ Introduction Agent
    ▼ handoff
 Coding Interviewer
    ├── get_current_code
+   ├── get_current_workspace
+   ├── get_execution_results
    ├── read_interview_rubric
    ├── record_interview_evidence
    │
    ▼ optional handoff
 Reflection Agent
    ├── get_current_code
+   ├── get_current_workspace
+   ├── get_execution_results
    ├── read_interview_rubric
    └── record_interview_evidence
 ```
@@ -139,7 +147,7 @@ Reflection Agent
 - Handles final complexity, tradeoff and edge-case discussion.
 - Challenges unsupported correctness or complexity claims.
 - Records final evidence.
-- Does not claim runtime correctness.
+- Separates browser test results from model judgment.
 
 ### 6.4 Go application server
 
@@ -148,7 +156,8 @@ Responsibilities:
 - Serve the embedded production frontend.
 - Load private configuration from `.env`.
 - Use `OPENAI_API_KEY` to mint short-lived Realtime client secrets.
-- Read questions from the local text question bank.
+- Read questions and checks from the local JSON question bank.
+- Store final tldraw scenes, summaries, and PNGs as private runtime artifacts.
 - Validate and append evidence events.
 - Validate and append interview-completion events.
 - Keep privileged credentials out of browser bundles.
@@ -179,7 +188,7 @@ Purpose: mandatory second setup tool.
 Flow:
 
 ```text
-Agent tool → GET /api/interview/question → questions/default.txt
+Agent tool → GET /api/interview/question → questions/default.json
 ```
 
 Returns the question identifier and statement. The result also updates the visible question panel.
@@ -205,7 +214,17 @@ Returns:
 }
 ```
 
-### 7.5 `record_interview_evidence`
+### 7.5 `get_current_workspace`
+
+Purpose: give the active agent one synchronized view of the candidate's code and visual reasoning.
+
+Returns exact code, code revision, whiteboard revision, and a compact tldraw scene summary. The browser separately attaches a whiteboard PNG to the Realtime turn when the board is non-empty.
+
+### 7.6 `get_execution_results`
+
+Purpose: return visible pass counts, failures, console output, and the code revision from the latest browser run.
+
+### 7.7 `record_interview_evidence`
 
 Purpose: persist a concrete rubric-relevant observation.
 
@@ -402,13 +421,13 @@ The policy is prompt-enforced in the current version. A production version shoul
 
 ## 16. Scalability evolution
 
-The current JSONL persistence and local text question bank are appropriate for a single-machine hackathon demo. A production evolution would introduce:
+The current JSONL persistence and local JSON question bank are appropriate for a single-machine hackathon demo. A production evolution would introduce:
 
 ```text
 Go instances
     │
     ├── PostgreSQL: interviews, rubrics, evidence and reports
-    ├── Object storage: recordings and screenshots
+    ├── Object storage: recordings and whiteboard artifacts
     ├── Redis: active session state and idempotency
     ├── Queue: asynchronous final evaluation
     └── Secret manager: OpenAI credentials
@@ -432,21 +451,23 @@ Additional production work:
 
 1. **Agents SDK in the browser:** enables direct Realtime media, local editor tools and visible agent lifecycle events.
 2. **Go as secure control plane:** protects the API key and owns durable server-side resources.
-3. **Explicit tool access:** the model reads question, rubric and code through auditable calls instead of implicit prompt injection.
+3. **Explicit tool access:** the model reads question, rubric, code, execution results, and scene summaries through auditable calls.
 4. **Specialist handoffs:** separates introduction, coding assessment and reflection behavior while retaining one voice session.
-5. **No code runner:** lowers hackathon complexity, with explicit disclosure that correctness is statically estimated.
+5. **Browser code runner:** gives visible test evidence while keeping the prototype self-contained.
 6. **Audio-event-driven shutdown:** prevents cutting off the final time-up announcement.
 7. **JSONL persistence:** provides a transparent, inspectable event trail for the prototype.
 
-## 18. Proactive code observation
+## 18. Proactive workspace review
 
-The browser runs a five-second revision monitor after the Realtime session connects. It compares the current Monaco revision with the last reviewed revision and triggers a review only when:
+The browser runs a 15-second workspace monitor after the Realtime session connects. It compares code and whiteboard revisions with the last reviewed pair. It triggers a review only when:
 
-- The code revision changed.
+- Code or whiteboard content changed.
+- Drawing stopped for at least two seconds.
 - The interview is not ending.
 - The active agent is listening rather than speaking or thinking.
+- No review is already active.
 
-The trigger instructs the active coding agent to call `get_current_code`. The agent asks one terse question only when the revision exposes a likely defect, unexplained decision or missing rubric signal. Unchanged code does not create model calls. This prevents overlapping turns while making the interviewer proactive rather than candidate-triggered.
+The browser attaches a bounded tldraw PNG when the board is non-empty. The trigger instructs the active agent to call `get_current_workspace` for exact code and a structured scene summary. The agent asks one terse question only when the change exposes a likely defect, contradiction, unexplained decision, or missing rubric signal. Unchanged work does not create model calls.
 
 The interviewer may challenge assumptions, request counterexamples and test edge cases indirectly. It must not deceive the candidate, invent constraints or contradict the supplied problem.
 
@@ -456,10 +477,11 @@ The implemented Evaluation Manager is a bounded backend workflow rather than ano
 
 ```text
 Finished React screen
-        │ POST question, rubric, final code, session metadata
+        │ POST question, rubric, final code, whiteboard, session metadata
         ▼
 POST /api/interview/evaluate
         ├── Load session evidence from runtime/evidence.jsonl
+        ├── Store final whiteboard artifacts in runtime/whiteboards/
         ├── Build strict assessment prompt
         ├── Call Codex through POST /v1/responses
         ├── Validate output against JSON Schema
@@ -467,7 +489,7 @@ POST /api/interview/evaluate
         └── Return structured report to React
 ```
 
-The report includes overall score, recommendation, summary, per-category score and weight, concrete evidence, evidence gaps, strengths, risks and limitations. Correctness remains a static estimate because code is not executed. Failed evaluations do not discard the completed interview and can be retried from the finished screen.
+The report includes overall score, recommendation, summary, per-category score and weight, concrete evidence, evidence gaps, strengths, risks and limitations. Browser test outcomes are verified artifacts. Other correctness claims remain model judgments. Failed evaluations do not discard the completed interview and can be retried from the finished screen.
 
 The evaluation model is configured by `OPENAI_EVALUATION_MODEL` and defaults to `gpt-5.2-codex`.
 

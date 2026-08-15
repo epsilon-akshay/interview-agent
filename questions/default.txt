@@ -1,8 +1,0 @@
-Implement a function `firstNonRepeatingCharacter` that receives a string and returns the index of the first character that appears exactly once. Return `-1` when every character repeats.
-
-Examples:
-- `"leetcode"` returns `0`
-- `"loveleetcode"` returns `2`
-- `"aabb"` returns `-1`
-
-Ask clarifying questions when requirements are ambiguous. Discuss the expected time and space complexity before finishing.
