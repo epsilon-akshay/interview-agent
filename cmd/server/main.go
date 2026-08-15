@@ -67,6 +67,10 @@ type evaluationRequest struct {
 	WhiteboardSummary  string `json:"whiteboardSummary"`
 	WhiteboardImage    string `json:"whiteboardImage"`
 	WhiteboardScene    string `json:"whiteboardScene"`
+	Transcript         []struct {
+		Role string `json:"role"`
+		Text string `json:"text"`
+	} `json:"transcript"`
 }
 
 type whiteboardMetadata struct {
@@ -101,6 +105,8 @@ func main() {
 	mux.HandleFunc("/api/local-voice/chat", localVoiceChatHandler)
 	mux.HandleFunc("/api/realtime/session", realtimeSessionHandler)
 	mux.HandleFunc("/api/realtime/token", realtimeTokenHandler)
+	mux.HandleFunc("/api/openai/", openAIProxyHandler)
+	mux.HandleFunc("/api/config", configHandler)
 	mux.HandleFunc("/api/interview/question", questionHandler)
 	mux.HandleFunc("/api/interview/evidence", evidenceHandler)
 	mux.HandleFunc("/api/interview/complete", completionHandler)
@@ -172,6 +178,13 @@ func realtimeTokenHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OpenAI rejected the Realtime token request", response.StatusCode)
 		return
 	}
+	var token map[string]any
+	if err := json.Unmarshal(body, &token); err != nil {
+		http.Error(w, "Realtime token response was invalid", http.StatusBadGateway)
+		return
+	}
+	token["model"] = model
+	body, _ = json.Marshal(token)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(body)
@@ -279,11 +292,25 @@ func evaluationHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	evidenceJSON, _ := json.Marshal(evidence)
+	var transcript strings.Builder
+	for _, turn := range input.Transcript {
+		speaker := "Candidate"
+		if turn.Role == "interviewer" {
+			speaker = "Interviewer"
+		}
+		if text := strings.TrimSpace(turn.Text); text != "" {
+			transcript.WriteString(speaker + ": " + text + "\n")
+		}
+	}
+	transcriptSection := strings.TrimSpace(transcript.String())
+	if transcriptSection == "" {
+		transcriptSection = "(no transcript was captured)"
+	}
 	model := strings.TrimSpace(os.Getenv("OPENAI_EVALUATION_MODEL"))
 	if model == "" {
 		model = "gpt-5.2-codex"
 	}
-	prompt := fmt.Sprintf(`Evaluate this coding interview strictly from the supplied artifacts. Do not infer personality, confidence, or facts not present. Test execution results are included in the evidence below. Where tests were run, treat pass and fail counts as verified fact. Where the candidate never ran their code, note that as a gap. Award low scores when evidence is missing. Each category must cite concrete observations from the evidence, code, or whiteboard.
+	prompt := fmt.Sprintf(`Evaluate this coding interview strictly from the supplied artifacts. Do not infer personality, confidence, or facts not present. Test execution results are included in the evidence below. Where tests were run, treat pass and fail counts as verified fact. Where the candidate never ran their code, note that as a gap. Award low scores when evidence is missing. Each category must cite concrete observations from the evidence, code, or whiteboard. Use the transcript as the primary evidence for communication and problem understanding. Quote the candidate's own words when citing communication evidence. If the transcript is empty, record that as an evidence gap rather than scoring communication from code alone.
 
 Treat the whiteboard as supporting evidence of technical reasoning. Cite only visible labels, relationships, and candidate explanations. Do not infer intent from an ambiguous sketch. Do not penalize an empty whiteboard unless the rubric explicitly requires diagramming. A diagram does not prove that the code works. If code and diagram conflict, describe the conflict. In limitations, do not claim code was never executed when code_execution evidence shows tests were run.
 
@@ -301,8 +328,11 @@ Final code:
 Whiteboard scene summary (revision %d):
 %s
 
+Interview transcript:
+%s
+
 Recorded evidence JSON:
-%s`, input.Candidate, input.Role, input.Question, input.Rubric, input.Code, input.WhiteboardRevision, input.WhiteboardSummary, evidenceJSON)
+%s`, input.Candidate, input.Role, input.Question, input.Rubric, input.Code, input.WhiteboardRevision, input.WhiteboardSummary, transcriptSection, evidenceJSON)
 	schema := map[string]any{
 		"type": "object", "additionalProperties": false,
 		"properties": map[string]any{

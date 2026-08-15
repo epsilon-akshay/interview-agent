@@ -5,6 +5,9 @@ import { buildEvidenceObservation, runCode } from "./runner/runCode";
 import type { QuestionConfig, RunResult } from "./runner/types";
 import { useInterviewAgent } from "./useInterviewAgent";
 import { EMPTY_WHITEBOARD_SNAPSHOT, type WhiteboardPanelHandle, type WhiteboardSnapshot } from "./whiteboard/types";
+import { initialiseAgentClient } from "./orchestrator/client";
+import { buildInterviewPlan } from "./orchestrator/plan";
+import type { ActivityRow, InterviewPlan } from "./orchestrator/types";
 
 type Screen = "lobby" | "interview" | "finished";
 type TestMode = "off" | "checks" | "voice";
@@ -79,6 +82,8 @@ export default function App() {
   const [runTab, setRunTab] = useState<"tests" | "output">("tests");
   const [workspaceTab, setWorkspaceTab] = useState<"code" | "whiteboard">("code");
   const [whiteboardSnapshot, setWhiteboardSnapshot] = useState<WhiteboardSnapshot>(EMPTY_WHITEBOARD_SNAPSHOT);
+  const [plan, setPlan] = useState<InterviewPlan | null>(null);
+  const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [testMode, setTestMode] = useState<TestMode>(() => {
     const saved = localStorage.getItem(TEST_MODE_STORAGE_KEY);
     return saved === "off" || saved === "checks" ? saved : "voice";
@@ -95,6 +100,10 @@ export default function App() {
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const lastRunRef = useRef<RunResult | null>(null);
   const mediaRef = useRef<MediaStream | null>(null);
+  const codeChangedAtRef = useRef(0);
+  const remainingRef = useRef(remaining);
+  const questionRef = useRef(question);
+  const planRef = useRef<InterviewPlan | null>(null);
   const whiteboardRef = useRef<WhiteboardPanelHandle | null>(null);
   const whiteboardSnapshotRef = useRef<WhiteboardSnapshot>(EMPTY_WHITEBOARD_SNAPSHOT);
   const finalWhiteboardRef = useRef<WhiteboardArtifacts | null>(null);
@@ -106,6 +115,8 @@ export default function App() {
   lastRunRef.current = runResult;
   mediaRef.current = stream;
   whiteboardSnapshotRef.current = whiteboardSnapshot;
+  remainingRef.current = remaining;
+  questionRef.current = question;
 
   useEffect(() => {
     localStorage.setItem(TEST_MODE_STORAGE_KEY, testMode);
@@ -120,6 +131,10 @@ export default function App() {
     const timer = window.setInterval(() => setRemaining((value) => Math.max(0, value - 1)), 1000);
     return () => window.clearInterval(timer);
   }, [screen, agent.status]);
+
+  useEffect(() => {
+    if (screen === "interview" && remaining === 15) void captureWhiteboardArtifacts();
+  }, [remaining, screen]);
 
   useEffect(() => {
     if (screen !== "interview" || remaining !== 0 || timerTriggeredRef.current) return;
@@ -176,6 +191,7 @@ export default function App() {
           sessionId: sessionIdRef.current,
           candidate: candidate.trim(), role: role.trim(), question,
           rubric: rubricRef.current, code: codeRef.current,
+          transcript: agent.getTranscript().map((turn) => ({ role: turn.role, text: turn.text })),
           whiteboardRevision: whiteboardSnapshotRef.current.revision,
           whiteboardSummary: whiteboardSnapshotRef.current.summary,
           whiteboardImage: whiteboard.image,
@@ -199,6 +215,19 @@ export default function App() {
     setFinishReason(reason === "time_limit" ? "Time is up" : "Interview ended");
     setScreen("finished");
     void evaluateInterview();
+  }
+
+  function recordCoverage(areaId: string) {
+    setPlan((current) => {
+      if (!current) return current;
+      const next = {
+        areas: current.areas.map((area) =>
+          area.id === areaId ? { ...area, evidenceCount: area.evidenceCount + 1 } : area
+        )
+      };
+      planRef.current = next;
+      return next;
+    });
   }
 
   function endInterviewOff(reason: "time_limit" | "manual") {
@@ -240,6 +269,9 @@ export default function App() {
       setRunning(false);
       setRunTab("tests");
       setWorkspaceTab("code");
+      setPlan(null);
+      planRef.current = null;
+      setActivity([]);
       finalWhiteboardRef.current = null;
       whiteboardRef.current?.reset();
       setWhiteboardSnapshot(EMPTY_WHITEBOARD_SNAPSHOT);
@@ -247,12 +279,30 @@ export default function App() {
       setRemaining(durationSeconds);
       setMicOn(true);
       setCameraOn(true);
+      remainingRef.current = durationSeconds;
+      questionRef.current = config.prompt;
       setQuestion(testMode === "off" ? config.prompt : "The Introduction Agent is fetching the question…");
       setEvaluation(null);
       setEvaluationError("");
       setScreen("interview");
       startRecording(media);
       if (testMode === "off") return;
+      void (async () => {
+        try {
+          await initialiseAgentClient();
+          const nextPlan = await buildInterviewPlan({
+            role: role.trim(),
+            rubric: rubricRef.current,
+            question: config.prompt,
+            durationSeconds
+          });
+          planRef.current = nextPlan;
+          setPlan(nextPlan);
+        } catch (planError) {
+          // The interview must still run without a plan.
+          console.warn("Interview plan unavailable", planError);
+        }
+      })();
       await agent.connect({
         sessionId,
         candidate: candidate.trim(),
@@ -268,7 +318,17 @@ export default function App() {
         getWhiteboardChangedAt: () => whiteboardSnapshotRef.current.changedAt,
         getWhiteboardSummary: () => whiteboardSnapshotRef.current.summary,
         getWhiteboardImage: () => whiteboardRef.current?.exportPng() ?? Promise.resolve(null),
-        onQuestion: setQuestion,
+        getCodeChangedAt: () => codeChangedAtRef.current,
+        getPlan: () => planRef.current,
+        getQuestionText: () => questionRef.current,
+        getRemainingSeconds: () => remainingRef.current,
+        getElapsedSeconds: () => durationSeconds - remainingRef.current,
+        onActivity: (row) => setActivity((rows) => [...rows.slice(-11), row]),
+        onObservation: (observation) => recordCoverage(observation.areaId),
+        onQuestion: (nextQuestion) => {
+          questionRef.current = nextQuestion;
+          setQuestion(nextQuestion);
+        },
         onFinished: (reason) => { void finalizeInterview(media, reason); }
       });
     } catch (reason) {
@@ -304,6 +364,9 @@ export default function App() {
     setCode(FALLBACK_STARTER);
     setRevision(0);
     setRunResult(null);
+    setPlan(null);
+    planRef.current = null;
+    setActivity([]);
     setWorkspaceTab("code");
     finalWhiteboardRef.current = null;
     whiteboardRef.current?.reset();
@@ -457,7 +520,7 @@ export default function App() {
                     theme="vs-dark"
                     value={code}
                     onMount={handleEditorMount}
-                    onChange={(value) => { setCode(value || ""); setRevision((current) => current + 1); }}
+                    onChange={(value) => { codeChangedAtRef.current = Date.now(); setCode(value || ""); setRevision((current) => current + 1); }}
                     options={{ minimap: { enabled: false }, fontSize: 14, lineHeight: 22, padding: { top: 18 }, automaticLayout: true }}
                   />
                 </div>
@@ -506,11 +569,22 @@ export default function App() {
                 </div>
               </div>
               {agent.error && testMode !== "off" && <div className="error voice-error">{agent.error}</div>}
-              <div className="tool-panel">
-                <div className="panel-title">AGENT TOOL CALLS</div>
+              {plan && (
+                <div className="coverage-panel">
+                  <div className="panel-title">RUBRIC COVERAGE</div>
+                  {plan.areas.map((area) => (
+                    <div className="coverage-row" key={area.id}>
+                      <div className="coverage-label"><span>{area.label}</span><small>{area.evidenceCount}</small></div>
+                      <div className="coverage-track"><span style={{ width: `${Math.min(100, (area.evidenceCount / 3) * 100)}%` }} /></div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="tool-panel activity-panel">
+                <div className="panel-title">AGENT ACTIVITY</div>
                 {testMode === "off" && <p className="empty-tools">AI is disabled in test mode.</p>}
-                {testMode !== "off" && agent.toolEvents.length === 0 && <p className="empty-tools">Waiting for introduction tools…</p>}
-                {agent.toolEvents.map((event, index) => <div className="tool-row" key={`${event.name}-${event.at}-${index}`}><span className={event.state} /> <code>{event.name}</code><small>{event.state}</small></div>)}
+                {testMode !== "off" && activity.length === 0 && <p className="empty-tools">Waiting for planning activity…</p>}
+                {activity.map((row, index) => <div className={`activity-row activity-${row.type}`} key={`${row.at}-${index}`}><span /> <code>{row.text}</code></div>)}
               </div>
               <div className="controls compact" aria-label="Interview controls">
                 <button className={!micOn ? "control off" : "control"} onClick={toggleMic}><Icon name="mic" /><span>{micOn ? "Mute" : "Unmute"}</span></button>
@@ -532,7 +606,13 @@ export default function App() {
               : "The agent closed the voice session gracefully and the backend recorded completion for session "}
             <code>{sessionIdRef.current.slice(0, 8)}</code>.
           </p>
-          {evaluating && <div className="evaluation-loading">Evaluation Manager is scoring the rubric…</div>}
+          {evaluating && (
+            <div className="evaluation-loading">
+              {plan
+                ? plan.areas.map((area) => <div className="evaluation-skeleton" key={area.id}><span>{area.label}</span><small>scoring…</small></div>)
+                : "Evaluation Manager is scoring the rubric…"}
+            </div>
+          )}
           {evaluationError && <div className="error" role="alert">{evaluationError} <button className="text-button" onClick={() => void evaluateInterview()}>Retry</button></div>}
           {evaluation && (
             <section className="evaluation-report">
