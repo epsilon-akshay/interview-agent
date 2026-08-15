@@ -55,15 +55,27 @@ Questions must derive from the problem, current code, or rubric. Valid challenge
 
 The candidate can switch between a Monaco editor and a tldraw whiteboard without losing either artifact. The whiteboard supports text, shapes, arrows, and freehand drawing. Code can run against visible browser-isolated checks.
 
-Every 15 seconds, the browser checks code and whiteboard revisions. When either changed and the agent is listening, it sends exact code, a compact scene summary, and a bounded whiteboard PNG. The interviewer asks one question only when the change exposes an unexplained choice, contradiction, likely defect, or missing rubric signal. Unchanged revisions, active drawing, and busy agent turns are skipped.
+The interviewer does not choose what to probe. A planning layer does, and hands it a finished question.
 
-This mechanism observes only Monaco and tldraw artifacts. It does not capture video, browser chrome, or unrelated screen content.
+A one-second monitor watches the editor, whiteboard, and test runs without calling any model. Before a question can be asked, five conditions must hold: 45 seconds since the last question, three seconds since the last keystroke, two seconds since the last whiteboard stroke, the agent is listening, and more than 20 seconds remain. A blocked signal waits rather than being discarded.
 
-### 6.5 Completion
+A single analysis call then records what changed and writes the next question. It runs in the ten seconds before the gate opens, so the question is usually ready before it is needed. A question arrives roughly four to five seconds after the trigger.
+
+Test results are recorded as evidence immediately, outside every gate, because pass and fail counts are facts rather than judgements.
+
+This mechanism observes Monaco artifacts, tldraw artifacts, test output, and the spoken transcript. It does not capture video, browser chrome, or unrelated screen content.
+
+### 6.5 Speech capture
+
+The session transcribes candidate speech. Transcript turns feed the analysis call during the interview and the final report afterwards.
+
+Communication and problem understanding are scored primarily from the candidate's own words. When no transcript exists, that is recorded as an evidence gap rather than inferred from code.
+
+### 6.6 Completion
 
 At zero seconds, the frontend prevents duplicate timer handling, marks the session as ending, mutes candidate audio, interrupts current output, records completion on the backend, and asks the active agent to say only that time is up. It closes after final audio or a ten-second fallback timeout. Manual ending follows the same flow.
 
-### 6.6 Evaluation Manager
+### 6.7 Evaluation Manager
 
 After the voice session closes, the frontend sends candidate metadata, problem, rubric, final code, final whiteboard scene, scene summary, and PNG to the backend. The backend loads session evidence and calls a Codex model through the Responses API with a strict JSON schema.
 
@@ -89,12 +101,13 @@ Missing evidence lowers confidence and may result in `insufficient_evidence`. Th
 | FR-6 | Read the UI rubric through a tool call before substantive interviewing. |
 | FR-7 | Inspect current editor text, execution results, and whiteboard summary through explicit tools. |
 | FR-8 | Persist rubric evidence with category, observation, confidence, and revision. |
-| FR-9 | Review changed code or whiteboard content every 15 seconds and avoid overlapping agent turns. |
+| FR-9 | Gate proactive questions behind deterministic checks and never interrupt active typing. |
 | FR-10 | Enforce a configurable timer and graceful terminal sequence. |
 | FR-11 | Generate and render a schema-validated final evaluation. |
 | FR-12 | Allow evaluation retry without repeating the interview. |
 | FR-13 | Preserve Code and Whiteboard tab content throughout an interview. |
 | FR-14 | Send a whiteboard PNG to live and final multimodal evaluation only when the board is non-empty. |
+| FR-15 | Transcribe candidate speech and supply it to live analysis and the final evaluation. |
 
 ## 8. Interview policy
 
@@ -156,7 +169,7 @@ Custom rubric text is supported. The Evaluation Manager must reflect configured 
 
 1. Starting an interview presents the server-controlled problem after all mandatory setup tools complete.
 2. Code and Whiteboard tabs preserve their content.
-3. Editing code or drawing causes a `get_current_workspace` review on the next eligible 15-second cycle.
+3. Editing code or drawing produces a question only after typing stops and the question gate opens.
 4. Unchanged workspace content does not cause repeated review prompts.
 5. Interviewer answers remain terse and never provide a hint or solution.
 6. Timer expiry produces one time-up announcement and one completion record.
@@ -167,7 +180,7 @@ Custom rubric text is supported. The Evaluation Manager must reflect configured 
 
 ## 14. Future scope
 
-- Transcript capture and evidence links to exact utterances
+- Evidence links to exact transcript utterances with stable ids
 - Recruiter-managed question and rubric banks
 - Shared or collaborative whiteboards
 - Persistent database storage and authenticated reviewer portal
