@@ -8,6 +8,9 @@ import { EMPTY_WHITEBOARD_SNAPSHOT, type WhiteboardPanelHandle, type WhiteboardS
 import { initialiseAgentClient } from "./orchestrator/client";
 import { buildInterviewPlan } from "./orchestrator/plan";
 import type { ActivityRow, InterviewPlan } from "./orchestrator/types";
+import { SetupWizard } from "./SetupWizard";
+import { saveInterviewSetup } from "./setup/api";
+import { DEFAULT_SETUP_DRAFT, formatRubricForAgent, validateSetupDraft, type InterviewSetupDraft } from "./setup/types";
 
 type Screen = "lobby" | "interview" | "finished";
 type TestMode = "off" | "checks" | "voice";
@@ -32,15 +35,6 @@ const TEST_MODE_OPTIONS: { value: TestMode; label: string }[] = [
   { value: "voice", label: "AI voice" }
 ];
 
-const DEFAULT_RUBRIC = `Assess the candidate on:
-- Problem understanding and clarifying questions (20%)
-- Choice and explanation of approach (25%)
-- Code quality and likely correctness (25%)
-- Time and space complexity analysis (15%)
-- Communication and response to feedback (15%)
-
-Do not score appearance, accent, personality, or confidence. When test execution evidence is present, treat pass and fail counts as verified fact.`;
-
 const FALLBACK_STARTER = `function firstNonRepeatingCharacter(input: string): number {
   // Explain your approach while you work.
 
@@ -57,10 +51,8 @@ function Icon({ name }: { name: "mic" | "camera" | "stop" }) {
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("lobby");
-  const [candidate, setCandidate] = useState("");
-  const [role, setRole] = useState("Software Engineer");
-  const [durationMinutes, setDurationMinutes] = useState(5);
-  const [rubric, setRubric] = useState(DEFAULT_RUBRIC);
+  const [setupDraft, setSetupDraft] = useState<InterviewSetupDraft>(DEFAULT_SETUP_DRAFT);
+  const [starting, setStarting] = useState(false);
   const [question, setQuestion] = useState("The Introduction Agent will fetch the question from the server question bank.");
   const [questionConfig, setQuestionConfig] = useState<QuestionConfig | null>(null);
   const [code, setCode] = useState(FALLBACK_STARTER);
@@ -88,6 +80,10 @@ export default function App() {
     const saved = localStorage.getItem(TEST_MODE_STORAGE_KEY);
     return saved === "off" || saved === "checks" ? saved : "voice";
   });
+  const candidate = setupDraft.candidateName;
+  const role = setupDraft.roleTitle;
+  const durationMinutes = setupDraft.durationMinutes;
+  const rubric = formatRubricForAgent(setupDraft);
   const videoRef = useRef<HTMLVideoElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -249,17 +245,21 @@ export default function App() {
 
   async function startInterview() {
     setError("");
-    if (!candidate.trim()) { setError("Enter your name to start the interview."); return; }
-    if (!rubric.trim()) { setError("Add an interview rubric."); return; }
+    const setupError = validateSetupDraft(setupDraft);
+    if (setupError) { setError(setupError); return; }
     if (!navigator.mediaDevices?.getUserMedia) { setError("Camera access requires a modern browser on localhost."); return; }
+    setStarting(true);
+    let media: MediaStream | null = null;
     try {
       const config = await loadQuestionConfig();
-      const media = await navigator.mediaDevices.getUserMedia({
+      media = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
         audio: { echoCancellation: true, noiseSuppression: true }
       });
+      const interviewMedia = media;
+      const savedSetup = await saveInterviewSetup(setupDraft);
       const durationSeconds = Math.max(60, Math.round(durationMinutes * 60));
-      const sessionId = crypto.randomUUID();
+      const sessionId = savedSetup.setupId;
       sessionIdRef.current = sessionId;
       timerTriggeredRef.current = false;
       setQuestionConfig(config);
@@ -275,7 +275,7 @@ export default function App() {
       finalWhiteboardRef.current = null;
       whiteboardRef.current?.reset();
       setWhiteboardSnapshot(EMPTY_WHITEBOARD_SNAPSHOT);
-      setStream(media);
+      setStream(interviewMedia);
       setRemaining(durationSeconds);
       setMicOn(true);
       setCameraOn(true);
@@ -285,7 +285,7 @@ export default function App() {
       setEvaluation(null);
       setEvaluationError("");
       setScreen("interview");
-      startRecording(media);
+      startRecording(interviewMedia);
       if (testMode === "off") return;
       void (async () => {
         try {
@@ -308,7 +308,7 @@ export default function App() {
         candidate: candidate.trim(),
         role: role.trim(),
         durationSeconds,
-        media,
+        media: interviewMedia,
         voiceEnabled: testMode === "voice",
         getRubric: () => rubricRef.current,
         getCode: () => codeRef.current,
@@ -329,10 +329,13 @@ export default function App() {
           questionRef.current = nextQuestion;
           setQuestion(nextQuestion);
         },
-        onFinished: (reason) => { void finalizeInterview(media, reason); }
+        onFinished: (reason) => { void finalizeInterview(interviewMedia, reason); }
       });
     } catch (reason) {
+      media?.getTracks().forEach((track) => track.stop());
       setError(reason instanceof Error ? reason.message : "Could not start the interview.");
+    } finally {
+      setStarting(false);
     }
   }
 
@@ -473,21 +476,14 @@ export default function App() {
       {screen === "lobby" && (
         <section className="lobby agent-lobby">
           <div className="lobby-copy">
-            <div className="eyebrow">AGENTIC CODING INTERVIEW</div>
             <h1>Configure once.<br /><em>Interview naturally.</em></h1>
-            <p className="lead">A realtime introduction agent fetches the question and rubric through tools, then hands the conversation to specialist coding agents.</p>
-          </div>
-          <div className="setup-card wide-setup">
-            <div className="setup-row">
-              <label>Your name<input value={candidate} onChange={(event) => setCandidate(event.target.value)} placeholder="e.g. Alex Morgan" autoFocus /></label>
-              <label>Interview role<input value={role} onChange={(event) => setRole(event.target.value)} /></label>
+            <p className="lead">Set the interview, rubric, candidate context, and workspace in one reviewed setup.</p>
+            <div className="setup-contract-note">
+              <strong>One setup snapshot</strong>
+              <p>The server validates every input before the interview starts.</p>
             </div>
-            <label>Time limit (minutes)<input type="number" min="1" max="60" value={durationMinutes} onChange={(event) => setDurationMinutes(Math.max(1, Number(event.target.value) || 5))} /></label>
-            <label>Evaluation rubric<textarea value={rubric} onChange={(event) => setRubric(event.target.value)} rows={9} /></label>
-            <div className="privacy-note"><span>✓</span><p><strong>Tool-driven setup</strong><br />The agent must fetch candidate context, question text, and this rubric before starting.</p></div>
-            {error && <div className="error" role="alert">{error}</div>}
-            <button className="primary" onClick={startInterview}>Start {durationMinutes}-minute interview <span>→</span></button>
           </div>
+          <SetupWizard value={setupDraft} onChange={setSetupDraft} onStart={() => void startInterview()} busy={starting} error={error} />
         </section>
       )}
 

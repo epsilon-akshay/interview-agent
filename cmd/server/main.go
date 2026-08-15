@@ -108,6 +108,9 @@ func main() {
 	mux.HandleFunc("/api/openai/", openAIProxyHandler)
 	mux.HandleFunc("/api/config", configHandler)
 	mux.HandleFunc("/api/interview/question", questionHandler)
+	mux.HandleFunc("/api/interview/setups", interviewSetupsHandler)
+	mux.HandleFunc("/api/interview/setups/", interviewSetupHandler)
+	mux.HandleFunc("/api/interview/uploads", interviewUploadHandler)
 	mux.HandleFunc("/api/interview/evidence", evidenceHandler)
 	mux.HandleFunc("/api/interview/complete", completionHandler)
 	mux.HandleFunc("/api/interview/evaluate", evaluationHandler)
@@ -438,6 +441,9 @@ func decodeJSONLimit(w http.ResponseWriter, r *http.Request, target any, limit i
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("invalid JSON request")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return fmt.Errorf("invalid JSON request")
 	}
 	return nil

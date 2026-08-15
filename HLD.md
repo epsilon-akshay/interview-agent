@@ -164,12 +164,16 @@ Responsibilities:
 
 - Serve the embedded production frontend.
 - Load private configuration from `.env`.
+- Validate and store a versioned `InterviewSetup` snapshot before interview start.
+- Store uploaded setup inputs as private runtime files.
 - Use `OPENAI_API_KEY` to mint short-lived Realtime client secrets.
 - Read questions and checks from the local JSON question bank.
 - Store final tldraw scenes, summaries, and PNGs as private runtime artifacts.
 - Validate and append evidence events.
 - Validate and append interview-completion events.
 - Keep privileged credentials out of browser bundles.
+
+The setup contract is independent from the browser's draft form state. The browser reuses its setup ID as the interview session ID. The current conducting layer does not read the saved setup yet. See [Interview Setup Backend v1](docs/plans/05-interview-setup-backend.md).
 
 The earlier manual WebRTC and local Codex CLI paths remain available as development fallbacks but are not the primary interview path.
 

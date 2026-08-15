@@ -46,6 +46,7 @@ Go server
 ├── Persists evidence and completion events
 ├── Stores final private whiteboard artifacts
 ├── Calls the Responses API for final structured evaluation
+├── Validates and stores versioned interview setup snapshots and uploads
 └── Serves the production frontend
 ```
 
@@ -113,6 +114,9 @@ Open <http://localhost:5173>. Vite proxies `/api` requests to Go on port 8080.
 | `GET` | `/api/health` | Server health |
 | `POST` | `/api/realtime/token` | Mint an ephemeral Realtime client secret |
 | `GET` | `/api/interview/question` | Load the coding problem, starter code, and tests |
+| `POST` | `/api/interview/uploads` | Store a private setup input file (10 MB maximum) |
+| `POST` | `/api/interview/setups` | Validate and save an InterviewSetup v1 snapshot |
+| `GET` | `/api/interview/setups/{id}` | Read a saved InterviewSetup v1 snapshot |
 | `POST` | `/api/interview/evidence` | Append a rubric evidence event |
 | `POST` | `/api/interview/complete` | Record the terminal event |
 | `POST` | `/api/interview/evaluate` | Generate the final structured report |
@@ -120,6 +124,8 @@ Open <http://localhost:5173>. Vite proxies `/api` requests to Go on port 8080.
 | `POST` | `/api/openai/v1/*` | Proxy planning-layer model calls, injecting the API key |
 
 Runtime events are written to `runtime/*.jsonl`. Final whiteboard scenes and PNGs are written to `runtime/whiteboards/`. Treat both as private interview data.
+
+Interview setup snapshots and uploads are written under `runtime/setups/{setupId}/`. See [Interview Setup Backend v1](docs/plans/05-interview-setup-backend.md) for the versioned contract and setup-ID lifecycle.
 
 ## Important limitations
 

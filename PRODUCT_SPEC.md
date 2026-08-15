@@ -41,6 +41,8 @@ Signal Interview standardizes this workflow while preserving an interactive conv
 
 The interview owner provides candidate name, role, time limit, and rubric. The default duration is five minutes. Start is blocked if candidate name or rubric is empty or media permissions fail.
 
+Before start, the setup UI saves one validated `InterviewSetup` v1 snapshot. It can include the interview type, question types, coding language, enabled workspaces, enabled channels, brief, structured rubric, and reviewed candidate information. Uploaded files remain private runtime artifacts. The UI reuses the setup ID as the interview session ID. The current conducting layer does not read the saved snapshot. Candidate information only tailors job-related questions when a later conducting-layer integration uses it. It does not count as scoring evidence or change rubric weights.
+
 ### 6.2 Introduction
 
 Before substantive speech, the Introduction Agent must retrieve interview context, fetch the problem from the server question bank, and read the configured rubric. It states the candidate name and time limit, presents the problem, asks for the candidate's understanding, and hands off.
@@ -108,6 +110,8 @@ Missing evidence lowers confidence and may result in `insufficient_evidence`. Th
 | FR-13 | Preserve Code and Whiteboard tab content throughout an interview. |
 | FR-14 | Send a whiteboard PNG to live and final multimodal evaluation only when the board is non-empty. |
 | FR-15 | Transcribe candidate speech and supply it to live analysis and the final evaluation. |
+| FR-16 | Validate and save a versioned interview setup snapshot before interview start. |
+| FR-17 | Store uploaded interview briefs, rubrics, and candidate files as private runtime artifacts. |
 
 ## 8. Interview policy
 
