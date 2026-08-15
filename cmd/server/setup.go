@@ -69,6 +69,7 @@ type setupInterview struct {
 	CodingLanguage  string   `json:"codingLanguage,omitempty"`
 	QuestionTypes   []string `json:"questionTypes"`
 	Workspaces      []string `json:"workspaces"`
+	Tools           []string `json:"tools"`
 	Channels        []string `json:"channels"`
 }
 
@@ -307,7 +308,10 @@ func validateInterviewSetup(setup interviewSetup) error {
 	if err := allowedTextList("interview.workspaces", setup.Interview.Workspaces, []string{"code_editor", "whiteboard"}, 0); err != nil {
 		return err
 	}
-	if err := allowedTextList("interview.channels", setup.Interview.Channels, []string{"voice", "chat"}, 1); err != nil {
+	if err := allowedTextList("interview.tools", setup.Interview.Tools, []string{"ai_chat"}, 0); err != nil {
+		return err
+	}
+	if err := allowedTextList("interview.channels", setup.Interview.Channels, []string{"voice"}, 1); err != nil {
 		return err
 	}
 	if len(setup.Brief.Text) > 100000 {

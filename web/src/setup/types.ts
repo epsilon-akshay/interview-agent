@@ -1,6 +1,7 @@
 export type InterviewType = "coding" | "system_design" | "behavioral" | "mixed";
 export type WorkspaceOption = "code_editor" | "whiteboard";
-export type ChannelOption = "voice" | "chat";
+export type ToolOption = "ai_chat";
+export type ChannelOption = "voice";
 
 export type RubricCriterionDraft = {
   id: string;
@@ -18,6 +19,7 @@ export type InterviewSetupDraft = {
   codingLanguage: string;
   questionTypes: string[];
   workspaces: WorkspaceOption[];
+  tools: ToolOption[];
   channels: ChannelOption[];
   briefText: string;
   briefFile: File | null;
@@ -40,6 +42,7 @@ export const DEFAULT_SETUP_DRAFT: InterviewSetupDraft = {
   codingLanguage: "TypeScript",
   questionTypes: ["problem_solving", "debugging", "complexity"],
   workspaces: ["code_editor", "whiteboard"],
+  tools: [],
   channels: ["voice"],
   briefText: "Run a focused technical interview for the selected role.",
   briefFile: null,

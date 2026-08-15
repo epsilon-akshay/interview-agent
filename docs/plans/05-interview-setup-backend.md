@@ -24,7 +24,7 @@ The server stores files under `runtime/setups/{setupId}/uploads/`. It stores the
 
 The snapshot includes its `setupId`, `version: 1`, and the fixed `candidateContextPolicy` value `job_related_question_tailoring_only`.
 
-It also includes candidate sources and reviewed facts, role, interview settings, brief, and a structured rubric. Interview types are `coding`, `system_design`, `behavioral`, or `mixed`. A resume can use `upload:{uploadId}`. LinkedIn, GitHub, and website sources must use HTTPS URLs. The API does not fetch those URLs.
+It also includes candidate sources and reviewed facts, role, interview settings, brief, and a structured rubric. Interview settings separate workspaces, candidate tools, and interview channels. AI chat uses `tools: ["ai_chat"]`. Voice uses `channels: ["voice"]`. Interview types are `coding`, `system_design`, `behavioral`, or `mixed`. A resume can use `upload:{uploadId}`. LinkedIn, GitHub, and website sources must use HTTPS URLs. The API does not fetch those URLs.
 
 The brief requires text or an attachment. A rubric can include structured criteria, optional `sourceText`, and source attachments. Rubric weights total 100.
 

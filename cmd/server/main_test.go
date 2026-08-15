@@ -130,6 +130,21 @@ func TestInterviewSetupRejectsInvalidRubricWeight(t *testing.T) {
 	}
 }
 
+func TestInterviewSetupRejectsAIChatAsChannel(t *testing.T) {
+	setup := validInterviewSetup()
+	setup.Interview.Tools = nil
+	setup.Interview.Channels = []string{"voice", "chat"}
+	body, err := json.Marshal(setup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	interviewSetupsHandler(recorder, httptest.NewRequest(http.MethodPost, "/api/interview/setups", bytes.NewReader(body)))
+	if recorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when AI chat is sent as a channel, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestInterviewSetupRejectsUnknownJSONFieldAndHTTPSource(t *testing.T) {
 	withTemporaryWorkingDirectory(t)
 	setup := validInterviewSetup()
@@ -277,7 +292,7 @@ func validInterviewSetup() interviewSetup {
 		CandidateContextPolicy: candidateContextPolicy,
 		Candidate:              setupCandidate{Name: "Alex Morgan", ReviewedFacts: []string{"Built Go services"}},
 		Role:                   setupRole{Title: "Backend Engineer", Level: "Senior"},
-		Interview:              setupInterview{Type: "coding", DurationSeconds: 1800, CodingLanguage: "go", QuestionTypes: []string{"coding", "debugging"}, Workspaces: []string{"code_editor", "whiteboard"}, Channels: []string{"voice"}},
+		Interview:              setupInterview{Type: "coding", DurationSeconds: 1800, CodingLanguage: "go", QuestionTypes: []string{"coding", "debugging"}, Workspaces: []string{"code_editor", "whiteboard"}, Tools: []string{"ai_chat"}, Channels: []string{"voice"}},
 		Brief:                  setupBrief{Text: "Assess API design and testing."},
 		Rubric:                 setupRubric{Criteria: []rubricCriterion{{ID: "design", Name: "API design", Weight: 60, ExpectedEvidence: "Explains contracts and trade-offs."}, {ID: "testing", Name: "Testing", Weight: 40, ExpectedEvidence: "Writes or explains focused tests."}}},
 	}

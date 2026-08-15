@@ -4,6 +4,7 @@ import type {
   InterviewSetupDraft,
   InterviewType,
   RubricCriterionDraft,
+  ToolOption,
   WorkspaceOption
 } from "./setup/types";
 import { setupStepError } from "./setup/types";
@@ -350,7 +351,7 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
           <>
             <div className="setup-step-heading">
               <h2>Choose access and review</h2>
-              <p>Save the candidate's workspaces and interview channels.</p>
+              <p>Set the candidate's workspaces, tools, and interview channel.</p>
             </div>
             <fieldset>
               <legend>Candidate workspaces</legend>
@@ -370,19 +371,24 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
               </div>
             </fieldset>
             <fieldset>
-              <legend>Interview channels</legend>
+              <legend>Candidate tools</legend>
+              <div className="setup-choice-grid">
+                <Choice
+                  checked={value.tools.includes("ai_chat")}
+                  label="AI chat"
+                  description="Use AI help while implementing code in the editor."
+                  onChange={() => update({ tools: toggleValue<ToolOption>(value.tools, "ai_chat") })}
+                />
+              </div>
+            </fieldset>
+            <fieldset>
+              <legend>Interview channel</legend>
               <div className="setup-choice-grid">
                 <Choice
                   checked={value.channels.includes("voice")}
                   label="Voice"
                   description="Run a spoken Realtime interview."
                   onChange={() => update({ channels: toggleValue<ChannelOption>(value.channels, "voice") })}
-                />
-                <Choice
-                  checked={value.channels.includes("chat")}
-                  label="AI chat"
-                  description="Save chat as an allowed channel."
-                  onChange={() => update({ channels: toggleValue<ChannelOption>(value.channels, "chat") })}
                 />
               </div>
             </fieldset>

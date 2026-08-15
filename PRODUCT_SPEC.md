@@ -41,7 +41,7 @@ Signal Interview standardizes this workflow while preserving an interactive conv
 
 The interview owner provides candidate name, role, time limit, and rubric. The default duration is five minutes. Start is blocked if candidate name or rubric is empty or media permissions fail.
 
-Before start, the setup UI saves one validated `InterviewSetup` v1 snapshot. It can include the interview type, question types, coding language, enabled workspaces, enabled channels, brief, structured rubric, and reviewed candidate information. Uploaded files remain private runtime artifacts. The UI reuses the setup ID as the interview session ID. The current conducting layer does not read the saved snapshot. Candidate information only tailors job-related questions when a later conducting-layer integration uses it. It does not count as scoring evidence or change rubric weights.
+Before start, the setup UI saves one validated `InterviewSetup` v1 snapshot. It can include the interview type, question types, coding language, enabled workspaces, candidate tools, interview channels, brief, structured rubric, and reviewed candidate information. AI chat is a candidate tool for implementation work in the code editor. It is not an interview channel. Uploaded files remain private runtime artifacts. The UI reuses the setup ID as the interview session ID. The current conducting layer does not read the saved snapshot. Candidate information only tailors job-related questions when a later conducting-layer integration uses it. It does not count as scoring evidence or change rubric weights.
 
 ### 6.2 Introduction
 

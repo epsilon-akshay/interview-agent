@@ -65,6 +65,7 @@ export async function saveInterviewSetup(draft: InterviewSetupDraft) {
         codingLanguage: draft.codingLanguage.trim(),
         questionTypes: draft.questionTypes,
         workspaces: draft.workspaces,
+        tools: draft.tools,
         channels: draft.channels
       },
       brief: {
