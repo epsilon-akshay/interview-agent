@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -56,12 +57,27 @@ type completionEvent struct {
 }
 
 type evaluationRequest struct {
+	SessionID          string `json:"sessionId"`
+	Candidate          string `json:"candidate"`
+	Role               string `json:"role"`
+	Question           string `json:"question"`
+	Rubric             string `json:"rubric"`
+	Code               string `json:"code"`
+	WhiteboardRevision int    `json:"whiteboardRevision"`
+	WhiteboardSummary  string `json:"whiteboardSummary"`
+	WhiteboardImage    string `json:"whiteboardImage"`
+	WhiteboardScene    string `json:"whiteboardScene"`
+	Transcript         []struct {
+		Role string `json:"role"`
+		Text string `json:"text"`
+	} `json:"transcript"`
+}
+
+type whiteboardMetadata struct {
 	SessionID string `json:"sessionId"`
-	Candidate string `json:"candidate"`
-	Role      string `json:"role"`
-	Question  string `json:"question"`
-	Rubric    string `json:"rubric"`
-	Code      string `json:"code"`
+	Revision  int    `json:"revision"`
+	Summary   string `json:"summary"`
+	CreatedAt string `json:"createdAt"`
 }
 
 type responseAPIResult struct {
@@ -89,6 +105,8 @@ func main() {
 	mux.HandleFunc("/api/local-voice/chat", localVoiceChatHandler)
 	mux.HandleFunc("/api/realtime/session", realtimeSessionHandler)
 	mux.HandleFunc("/api/realtime/token", realtimeTokenHandler)
+	mux.HandleFunc("/api/openai/", openAIProxyHandler)
+	mux.HandleFunc("/api/config", configHandler)
 	mux.HandleFunc("/api/interview/question", questionHandler)
 	mux.HandleFunc("/api/interview/evidence", evidenceHandler)
 	mux.HandleFunc("/api/interview/complete", completionHandler)
@@ -160,6 +178,13 @@ func realtimeTokenHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OpenAI rejected the Realtime token request", response.StatusCode)
 		return
 	}
+	var token map[string]any
+	if err := json.Unmarshal(body, &token); err != nil {
+		http.Error(w, "Realtime token response was invalid", http.StatusBadGateway)
+		return
+	}
+	token["model"] = model
+	body, _ = json.Marshal(token)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(body)
@@ -170,13 +195,13 @@ func questionHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	question, err := os.ReadFile("questions/default.txt")
-	if err != nil {
+	raw, err := os.ReadFile("questions/default.json")
+	if err != nil || !json.Valid(raw) {
 		http.Error(w, "question bank is unavailable", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"id": "first-non-repeating-character", "question": strings.TrimSpace(string(question))})
+	_, _ = w.Write(raw)
 }
 
 func evidenceHandler(w http.ResponseWriter, r *http.Request) {
@@ -231,12 +256,29 @@ func evaluationHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input evaluationRequest
-	if err := decodeJSON(w, r, &input); err != nil {
+	if err := decodeJSONLimit(w, r, &input, 8<<20); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if input.SessionID == "" || strings.TrimSpace(input.Question) == "" || strings.TrimSpace(input.Rubric) == "" {
 		http.Error(w, "sessionId, question and rubric are required", http.StatusBadRequest)
+		return
+	}
+	if _, err := safeArtifactName(input.SessionID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	whiteboardPNG, err := decodeWhiteboardPNG(input.WhiteboardImage)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if input.WhiteboardScene != "" && !json.Valid([]byte(input.WhiteboardScene)) {
+		http.Error(w, "whiteboardScene is not valid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := saveWhiteboardArtifacts(input, whiteboardPNG); err != nil {
+		http.Error(w, "could not save whiteboard artifacts", http.StatusInternalServerError)
 		return
 	}
 	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
@@ -250,11 +292,27 @@ func evaluationHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	evidenceJSON, _ := json.Marshal(evidence)
+	var transcript strings.Builder
+	for _, turn := range input.Transcript {
+		speaker := "Candidate"
+		if turn.Role == "interviewer" {
+			speaker = "Interviewer"
+		}
+		if text := strings.TrimSpace(turn.Text); text != "" {
+			transcript.WriteString(speaker + ": " + text + "\n")
+		}
+	}
+	transcriptSection := strings.TrimSpace(transcript.String())
+	if transcriptSection == "" {
+		transcriptSection = "(no transcript was captured)"
+	}
 	model := strings.TrimSpace(os.Getenv("OPENAI_EVALUATION_MODEL"))
 	if model == "" {
 		model = "gpt-5.2-codex"
 	}
-	prompt := fmt.Sprintf(`Evaluate this coding interview strictly from the supplied artifacts. Do not infer personality, confidence, or facts not present. Code was not executed, so correctness is only a static estimate. Award low scores when evidence is missing. Each category must cite concrete observations from the evidence or code.
+	prompt := fmt.Sprintf(`Evaluate this coding interview strictly from the supplied artifacts. Do not infer personality, confidence, or facts not present. Test execution results are included in the evidence below. Where tests were run, treat pass and fail counts as verified fact. Where the candidate never ran their code, note that as a gap. Award low scores when evidence is missing. Each category must cite concrete observations from the evidence, code, or whiteboard. Use the transcript as the primary evidence for communication and problem understanding. Quote the candidate's own words when citing communication evidence. If the transcript is empty, record that as an evidence gap rather than scoring communication from code alone.
+
+Treat the whiteboard as supporting evidence of technical reasoning. Cite only visible labels, relationships, and candidate explanations. Do not infer intent from an ambiguous sketch. Do not penalize an empty whiteboard unless the rubric explicitly requires diagramming. A diagram does not prove that the code works. If code and diagram conflict, describe the conflict. In limitations, do not claim code was never executed when code_execution evidence shows tests were run.
 
 Candidate: %s
 Role: %s
@@ -267,8 +325,14 @@ Rubric:
 Final code:
 %s
 
+Whiteboard scene summary (revision %d):
+%s
+
+Interview transcript:
+%s
+
 Recorded evidence JSON:
-%s`, input.Candidate, input.Role, input.Question, input.Rubric, input.Code, evidenceJSON)
+%s`, input.Candidate, input.Role, input.Question, input.Rubric, input.Code, input.WhiteboardRevision, input.WhiteboardSummary, transcriptSection, evidenceJSON)
 	schema := map[string]any{
 		"type": "object", "additionalProperties": false,
 		"properties": map[string]any{
@@ -289,9 +353,14 @@ Recorded evidence JSON:
 		},
 		"required": []string{"overallScore", "recommendation", "summary", "categories", "strengths", "risks", "limitations"},
 	}
+	content := []map[string]any{{"type": "input_text", "text": prompt}}
+	if input.WhiteboardImage != "" {
+		content = append(content, map[string]any{"type": "input_image", "image_url": input.WhiteboardImage, "detail": "high"})
+	}
 	payload, _ := json.Marshal(map[string]any{
-		"model": model, "input": prompt,
-		"text": map[string]any{"format": map[string]any{"type": "json_schema", "name": "interview_evaluation", "strict": true, "schema": schema}},
+		"model": model,
+		"input": []map[string]any{{"role": "user", "content": content}},
+		"text":  map[string]any{"format": map[string]any{"type": "json_schema", "name": "interview_evaluation", "strict": true, "schema": schema}},
 	})
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -362,12 +431,84 @@ func evidenceForSession(path, sessionID string) ([]evidenceEvent, error) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10))
+	return decodeJSONLimit(w, r, target, 128<<10)
+}
+
+func decodeJSONLimit(w http.ResponseWriter, r *http.Request, target any, limit int64) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("invalid JSON request")
 	}
 	return nil
+}
+
+func decodeWhiteboardPNG(dataURL string) ([]byte, error) {
+	if dataURL == "" {
+		return nil, nil
+	}
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(dataURL, prefix) {
+		return nil, fmt.Errorf("whiteboardImage must be a PNG data URL")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(dataURL, prefix))
+	if err != nil || len(decoded) < 8 || !bytes.Equal(decoded[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return nil, fmt.Errorf("whiteboardImage is not a valid PNG")
+	}
+	if len(decoded) > 5<<20 {
+		return nil, fmt.Errorf("whiteboardImage exceeds the 5 MB limit")
+	}
+	return decoded, nil
+}
+
+func saveWhiteboardArtifacts(input evaluationRequest, png []byte) error {
+	name, err := safeArtifactName(input.SessionID)
+	if err != nil {
+		return err
+	}
+	directory := "runtime/whiteboards"
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	metadata, err := json.MarshalIndent(whiteboardMetadata{
+		SessionID: input.SessionID,
+		Revision:  input.WhiteboardRevision,
+		Summary:   input.WhiteboardSummary,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(directory, name+".summary.json"), metadata, 0o600); err != nil {
+		return err
+	}
+	if input.WhiteboardScene != "" {
+		if !json.Valid([]byte(input.WhiteboardScene)) {
+			return fmt.Errorf("whiteboardScene is not valid JSON")
+		}
+		if err := os.WriteFile(filepath.Join(directory, name+".tldr"), []byte(input.WhiteboardScene), 0o600); err != nil {
+			return err
+		}
+	}
+	if len(png) > 0 {
+		if err := os.WriteFile(filepath.Join(directory, name+".png"), png, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func safeArtifactName(value string) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf("sessionId is required")
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_' {
+			continue
+		}
+		return "", fmt.Errorf("sessionId contains unsupported characters")
+	}
+	return value, nil
 }
 
 func appendJSONLine(path string, value any) error {

@@ -1,6 +1,10 @@
 import { useCallback, useRef, useState } from "react";
 import { RealtimeAgent, RealtimeSession, OpenAIRealtimeWebRTC, tool } from "@openai/agents/realtime";
 import { z } from "zod";
+import type { RunResult } from "./runner/types";
+import type { ActivityRow, InterviewPlan, Observation, TranscriptTurn } from "./orchestrator/types";
+import { startSignalBus } from "./orchestrator/signalBus";
+import { zeroHintGuardrail } from "./orchestrator/guardrails";
 
 export type AgentStatus = "idle" | "connecting" | "listening" | "thinking" | "speaking" | "ending" | "error";
 
@@ -10,9 +14,23 @@ export type InterviewAgentConfig = {
   role: string;
   durationSeconds: number;
   media: MediaStream;
+  voiceEnabled: boolean;
   getRubric: () => string;
   getCode: () => string;
   getCodeRevision: () => number;
+  getLastRun: () => RunResult | null;
+  getWhiteboardRevision: () => number;
+  getWhiteboardChangedAt: () => number;
+  getWhiteboardSummary: () => string;
+  getWhiteboardImage: () => Promise<string | null>;
+  getCodeChangedAt: () => number;
+  getPlan: () => InterviewPlan | null;
+  getQuestionText: () => string;
+  getRemainingSeconds: () => number;
+  getElapsedSeconds: () => number;
+  onActivity: (row: ActivityRow) => void;
+  onObservation: (observation: Observation) => void;
+  onTranscriptTurn?: (turn: TranscriptTurn) => void;
   onQuestion: (question: string) => void;
   onFinished: (reason: string) => void;
 };
@@ -36,8 +54,13 @@ export function useInterviewAgent() {
   const endingReasonRef = useRef<"time_limit" | "manual">("time_limit");
   const closingAudioRef = useRef(false);
   const endFallbackRef = useRef<number | null>(null);
-  const codeScanRef = useRef<number | null>(null);
-  const lastScannedRevisionRef = useRef(-1);
+  const observationsRef = useRef<Observation[]>([]);
+  const askedQuestionsRef = useRef<string[]>([]);
+  const stopSignalBusRef = useRef<(() => void) | null>(null);
+  const transcriptRef = useRef<TranscriptTurn[]>([]);
+  const seenTranscriptItemsRef = useRef<Set<string>>(new Set());
+  const whiteboardImageCacheRef = useRef<string | null>(null);
+  const imageCacheTimerRef = useRef<number | null>(null);
   const statusRef = useRef<AgentStatus>("idle");
 
   const updateStatus = useCallback((next: AgentStatus) => {
@@ -51,9 +74,11 @@ export function useInterviewAgent() {
 
   const closeNow = useCallback((reason: string) => {
     if (endFallbackRef.current !== null) window.clearTimeout(endFallbackRef.current);
-    if (codeScanRef.current !== null) window.clearInterval(codeScanRef.current);
     endFallbackRef.current = null;
-    codeScanRef.current = null;
+    stopSignalBusRef.current?.();
+    stopSignalBusRef.current = null;
+    if (imageCacheTimerRef.current !== null) window.clearInterval(imageCacheTimerRef.current);
+    imageCacheTimerRef.current = null;
     sessionRef.current?.close();
     sessionRef.current = null;
     updateStatus("idle");
@@ -85,14 +110,14 @@ export function useInterviewAgent() {
 
     const fetchCodingQuestion = tool({
       name: "fetch_coding_question",
-      description: "Mandatory second tool. Fetch the coding question from the server-side text question bank.",
+      description: "Mandatory second tool. Fetch the coding question from the server-side question bank.",
       parameters: z.object({}),
       async execute() {
         const response = await fetch("/api/interview/question");
         if (!response.ok) throw new Error("Question bank is unavailable.");
-        const data = await response.json() as { id: string; question: string };
-        config.onQuestion(data.question);
-        return data;
+        const data = await response.json() as { id: string; prompt: string };
+        config.onQuestion(data.prompt);
+        return { id: data.id, prompt: data.prompt };
       }
     });
 
@@ -111,6 +136,54 @@ export function useInterviewAgent() {
       parameters: z.object({ reason: z.string() }),
       async execute({ reason }) {
         return { reason, language: "typescript", revision: config.getCodeRevision(), code: config.getCode() };
+      }
+    });
+
+    const getCurrentWorkspace = tool({
+      name: "get_current_workspace",
+      description: "Inspect the candidate's current code and the structured tldraw scene summary before asking about either artifact.",
+      parameters: z.object({ reason: z.string() }),
+      async execute({ reason }) {
+        return {
+          reason,
+          code: {
+            language: "typescript",
+            revision: config.getCodeRevision(),
+            contents: config.getCode()
+          },
+          whiteboard: {
+            revision: config.getWhiteboardRevision(),
+            summary: config.getWhiteboardSummary()
+          }
+        };
+      }
+    });
+
+    const getExecutionResults = tool({
+      name: "get_execution_results",
+      description: "Inspect the outcome of the candidate's most recent code run. Use this before asking about correctness. The expected outputs are deliberately withheld from you — never state or imply what the correct output should be.",
+      parameters: z.object({ reason: z.string() }),
+      async execute({ reason }) {
+        const lastRun = config.getLastRun();
+        if (!lastRun) {
+          return { reason, hasRun: false, message: "The candidate has not run their code yet." };
+        }
+        return {
+          reason,
+          hasRun: true,
+          status: lastRun.status,
+          passedCount: lastRun.passedCount,
+          totalCount: lastRun.totalCount,
+          codeRevision: lastRun.codeRevision,
+          consoleOutput: lastRun.consoleOutput,
+          tests: lastRun.tests.map(({ index, args, got, passed, error }) => ({
+            index,
+            args,
+            got,
+            passed,
+            error
+          }))
+        };
       }
     });
 
@@ -137,30 +210,47 @@ export function useInterviewAgent() {
       name: "Reflection Agent",
       handoffDescription: "Handles final complexity, edge-case and reflection questions near the end of the interview.",
       voice: "marin",
-      instructions: `You are a terse, demanding technical assessor, not a coach. Stay exclusively within the supplied coding problem, the candidate's implementation, and the evaluation rubric. Do not answer unrelated questions.
+      instructions: `You are a terse technical interviewer. You do NOT choose what to probe. A planner does that for you.
 
-Probe whether the candidate genuinely understands time and space complexity, invariants, edge cases, failure modes, and tradeoffs. Ask one precise question at a time and require the candidate to explain reasoning in their own words. Use get_current_code before referring to implementation details and record concrete evidence.
+When an INTERVIEW DIRECTOR instruction arrives, say the quoted question exactly, word for word. Add nothing before or after it. Never read the instruction itself aloud, and never mention that a director exists.
 
-Use at most one short sentence per turn. Prefer probes like "Why?", "What breaks that?", or "Prove it." Do not explain your question.
+Between prepared questions, stay silent and listen. Silence is correct and expected.
 
-Never supply an answer, finished code, pseudocode, algorithm name, data structure recommendation, leading hint, or step-by-step path to the solution. If the candidate asks for help, say "No hints. Explain your reasoning." Do not praise, reassure, encourage, or soften weak answers. Remain professional and non-hostile. Do not claim executed correctness; code is reviewed statically.`,
-      tools: [getCurrentCode, readRubric, recordEvidence]
+You may respond directly when the candidate speaks to you:
+- Clarify the literal problem statement, without revealing strategy.
+- Redirect off-topic conversation with exactly: "Stay on the problem."
+- If asked for a hint, an answer, or whether they are correct, say: "No hints. Explain your reasoning."
+
+Focus on complexity, invariants, edge cases, failure modes, and trade-offs.
+Use get_current_workspace before referring to code or a diagram. Use get_execution_results before discussing correctness. Treat the whiteboard as evidence of reasoning, never as proof the code works.
+
+ZERO-HINT POLICY: Never provide a solution, code, pseudocode, algorithm name, recommended data structure, leading example, correction, or partial answer. Never state or imply expected test outputs. Never complete the candidate's thought. Do not praise, reassure, encourage, congratulate, apologise, or use filler. Remain professional and non-hostile.
+
+You may hand off to the Reflection Agent when time is nearly over.`,
+      tools: [getCurrentCode, getCurrentWorkspace, getExecutionResults, readRubric, recordEvidence]
     });
 
     const codingAgent = new RealtimeAgent({
       name: "Coding Interviewer",
       handoffDescription: "Conducts the main code-writing and reasoning portion after the question is presented.",
       voice: "marin",
-      instructions: `You are a terse, demanding technical interviewer evaluating knowledge, not teaching or helping. Stay exclusively within the fetched coding question, the candidate's code, and the recruiter rubric. Redirect unrelated conversation with: "Stay on the problem."
+      instructions: `You are a terse technical interviewer. You do NOT choose what to probe. A planner does that for you.
 
-Ask one precise question at a time and allow silence. Every spoken turn must be one short sentence, normally under 12 words. Never explain why you asked. Systematically test requirements, assumptions, approach, invariants, correctness, edge cases, complexity, testing, and code revisions. Challenge claims with "Why?", "Prove it.", "What breaks that?", or a counterexample request. Inspect code before discussing it. Use the rubric to target missing evidence and record only observable evidence.
+When an INTERVIEW DIRECTOR instruction arrives, say the quoted question exactly, word for word. Add nothing before or after it. Never read the instruction itself aloud, and never mention that a director exists.
 
-Challenge without deception: question assumptions, introduce valid edge cases, and ask indirect follow-ups, but never invent requirements, contradict the problem, or deliberately provide false facts. When a periodic code-review message arrives, call get_current_code. Ask a question only when the new code exposes a meaningful rubric gap, unexplained choice, or likely defect; otherwise remain silent.
+Between prepared questions, stay silent and listen. Silence is correct and expected.
 
-ZERO-HINT POLICY: Never provide the solution, code, pseudocode, algorithm name, recommended data structure, leading example, correction, partial answer, or sequence of steps. Do not complete the candidate's thought. If asked for a hint, answer, validation, or "am I right?", say only that you cannot provide assistance during the assessment, then ask the candidate to explain or test their own reasoning. You may clarify the literal problem statement, but the clarification must not reveal strategy.
+You may respond directly when the candidate speaks to you:
+- Clarify the literal problem statement, without revealing strategy.
+- Redirect off-topic conversation with exactly: "Stay on the problem."
+- If asked for a hint, an answer, or whether they are correct, say: "No hints. Explain your reasoning."
 
-Do not praise, reassure, encourage, congratulate, apologize, use filler, or summarize the candidate's answer. Remain professional and non-hostile. You may hand off to the Reflection Agent once the implementation discussion is mature or time is nearly over.`,
-      tools: [getCurrentCode, readRubric, recordEvidence],
+Use get_current_workspace before referring to code or a diagram. Use get_execution_results before discussing correctness. Treat the whiteboard as evidence of reasoning, never as proof the code works.
+
+ZERO-HINT POLICY: Never provide a solution, code, pseudocode, algorithm name, recommended data structure, leading example, correction, or partial answer. Never state or imply expected test outputs. Never complete the candidate's thought. Do not praise, reassure, encourage, congratulate, apologise, or use filler. Remain professional and non-hostile.
+
+You may hand off to the Reflection Agent when time is nearly over.`,
+      tools: [getCurrentCode, getCurrentWorkspace, getExecutionResults, readRubric, recordEvidence],
       handoffs: [reflectionAgent]
     });
 
@@ -176,17 +266,27 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
 
     const tokenResponse = await fetch("/api/realtime/token", { method: "POST" });
     if (!tokenResponse.ok) throw new Error((await tokenResponse.text()).trim() || "Could not create a Realtime token.");
-    const token = await tokenResponse.json() as { value?: string };
+    const token = await tokenResponse.json() as { value?: string; model?: string };
     if (!token.value) throw new Error("Realtime token response was invalid.");
+    if (!token.model) throw new Error("Realtime token model was missing.");
 
     const transport = new OpenAIRealtimeWebRTC({ mediaStream: config.media });
     const session = new RealtimeSession(introductionAgent, {
       transport,
-      model: "gpt-realtime-2.1-mini",
+      model: token.model,
       workflowName: "Automated Coding Interview",
       groupId: config.sessionId,
       traceMetadata: { sessionId: config.sessionId, role: config.role },
-      config: { audio: { input: { turnDetection: { type: "semantic_vad" } } } }
+      outputGuardrails: [zeroHintGuardrail],
+      config: {
+        ...(config.voiceEnabled ? {} : { outputModalities: ["text"] as const }),
+         audio: {
+           input: {
+             transcription: { model: "gpt-4o-mini-transcribe", delay: "low" },
+             turnDetection: { type: "semantic_vad" }
+           }
+         }
+      }
     });
     sessionRef.current = session;
     session.on("agent_start", () => updateStatus("thinking"));
@@ -198,19 +298,102 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
     });
     session.on("audio_interrupted", () => { if (!endingRef.current) updateStatus("listening"); });
     session.on("agent_handoff", (_context, _from, to) => setActiveAgent(to.name));
-    session.on("agent_tool_start", (_context, _agent, calledTool) => logTool(calledTool.name, "running"));
-    session.on("agent_tool_end", (_context, _agent, calledTool) => logTool(calledTool.name, "complete"));
+    session.on("agent_tool_start", (_context, _agent, calledTool) => {
+      logTool(calledTool.name, "running");
+      config.onActivity({ type: "tool", text: `${calledTool.name} · running`, at: Date.now() });
+    });
+    session.on("agent_tool_end", (_context, _agent, calledTool) => {
+      logTool(calledTool.name, "complete");
+      config.onActivity({ type: "tool", text: `${calledTool.name} · complete`, at: Date.now() });
+    });
+    session.on("transport_event", (event: any) => {
+      if (event?.type !== "conversation.item.input_audio_transcription.completed") return;
+      if (!event.transcript || seenTranscriptItemsRef.current.has(event.item_id)) return;
+      seenTranscriptItemsRef.current.add(event.item_id);
+      const turn: TranscriptTurn = { role: "candidate", text: String(event.transcript).trim(), at: Date.now() };
+      transcriptRef.current = [...transcriptRef.current, turn];
+      config.onTranscriptTurn?.(turn);
+    });
+    session.on("history_updated", (history: any[]) => {
+      for (const item of history) {
+        if (item?.type !== "message" || item?.role !== "assistant") continue;
+        const itemId = String(item.itemId ?? item.id ?? "");
+        if (!itemId || seenTranscriptItemsRef.current.has(itemId)) continue;
+        const text = (item.content ?? [])
+          .map((part: any) => part?.transcript ?? part?.text ?? "")
+          .join(" ")
+          .trim();
+        if (!text) continue;
+        seenTranscriptItemsRef.current.add(itemId);
+        const turn: TranscriptTurn = { role: "interviewer", text, at: Date.now() };
+        transcriptRef.current = [...transcriptRef.current, turn];
+        config.onTranscriptTurn?.(turn);
+      }
+    });
+    session.on("guardrail_tripped", (_context, _agent, details) => {
+      config.onActivity({ type: "guardrail", text: `zero_hint blocked: ${JSON.stringify(details)}`, at: Date.now() });
+    });
     session.on("error", (event) => { setError(errorMessage(event)); updateStatus("error"); });
-    await session.connect({ apiKey: token.value, model: "gpt-realtime-2.1-mini" });
+    await session.connect({ apiKey: token.value, model: token.model });
     updateStatus("listening");
     session.sendMessage("Begin the interview now. Follow the mandatory introduction tool sequence before presenting the question.");
-    lastScannedRevisionRef.current = config.getCodeRevision();
-    codeScanRef.current = window.setInterval(() => {
-      const revision = config.getCodeRevision();
-      if (endingRef.current || statusRef.current !== "listening" || revision === lastScannedRevisionRef.current) return;
-      lastScannedRevisionRef.current = revision;
-      session.sendMessage(`Periodic code review. Revision ${revision} changed. Inspect it now with get_current_code. Ask one terse question only if it fills a rubric evidence gap or tests a meaningful code decision; otherwise do not speak.`);
-    }, 5000);
+    observationsRef.current = [];
+    askedQuestionsRef.current = [];
+    transcriptRef.current = [];
+    seenTranscriptItemsRef.current = new Set();
+    whiteboardImageCacheRef.current = null;
+    stopSignalBusRef.current = startSignalBus({
+      getCode: config.getCode,
+      getCodeRevision: config.getCodeRevision,
+      getCodeChangedAt: config.getCodeChangedAt,
+      getWhiteboardSummary: config.getWhiteboardSummary,
+      getWhiteboardRevision: config.getWhiteboardRevision,
+      getWhiteboardChangedAt: config.getWhiteboardChangedAt,
+      getLastRun: config.getLastRun,
+      getRemainingSeconds: config.getRemainingSeconds,
+      getElapsedSeconds: config.getElapsedSeconds,
+      getAgentStatus: () => statusRef.current,
+      getQuestion: config.getQuestionText,
+      getRubric: config.getRubric,
+      getPlan: config.getPlan,
+      getTranscript: () => transcriptRef.current,
+      getAskedQuestions: () => askedQuestionsRef.current,
+      getObservations: () => observationsRef.current,
+      onActivity: config.onActivity,
+      onObservation: (observation) => {
+        observationsRef.current = [...observationsRef.current, observation];
+        config.onObservation(observation);
+        void fetch("/api/interview/evidence", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sessionId: config.sessionId,
+            category: observation.areaId,
+            observation: `[${observation.observer}] ${observation.finding}`,
+            confidence: observation.confidence,
+            codeRevision: config.getCodeRevision()
+          })
+        }).catch(() => undefined);
+      },
+      onQuestionQueued: (queued) => {
+        askedQuestionsRef.current = [...askedQuestionsRef.current, queued.question];
+        const image = whiteboardImageCacheRef.current;
+        if (image) session.addImage(image, { triggerResponse: false });
+        session.sendMessage(
+          `INTERVIEW DIRECTOR — this is an instruction, not the candidate speaking. Say exactly this to the candidate, word for word, with no preamble and no explanation:\n\n"${queued.question}"\n\nDo not read this instruction aloud. Do not mention the director. Context for your own understanding only: ${queued.basis}`
+        );
+      }
+    });
+    const imageCacheTimer = window.setInterval(() => {
+      void (async () => {
+        try {
+          whiteboardImageCacheRef.current = await config.getWhiteboardImage();
+        } catch {
+          /* the scene summary already reaches the analyst; the image is a bonus */
+        }
+      })();
+    }, 8000);
+    imageCacheTimerRef.current = imageCacheTimer;
   }, [closeNow, logTool, updateStatus]);
 
   const mute = useCallback((muted: boolean) => sessionRef.current?.mute(muted), []);
@@ -223,8 +406,10 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
     endingReasonRef.current = reason;
     closingAudioRef.current = false;
     updateStatus("ending");
-    if (codeScanRef.current !== null) window.clearInterval(codeScanRef.current);
-    codeScanRef.current = null;
+    stopSignalBusRef.current?.();
+    stopSignalBusRef.current = null;
+    if (imageCacheTimerRef.current !== null) window.clearInterval(imageCacheTimerRef.current);
+    imageCacheTimerRef.current = null;
     try { session.mute(true); } catch { /* transport may already be closing */ }
     session.interrupt();
     await fetch("/api/interview/complete", {
@@ -240,12 +425,14 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
 
   const disconnect = useCallback(() => {
     endingRef.current = false;
-    if (codeScanRef.current !== null) window.clearInterval(codeScanRef.current);
-    codeScanRef.current = null;
+    stopSignalBusRef.current?.();
+    stopSignalBusRef.current = null;
+    if (imageCacheTimerRef.current !== null) window.clearInterval(imageCacheTimerRef.current);
+    imageCacheTimerRef.current = null;
     sessionRef.current?.close();
     sessionRef.current = null;
     updateStatus("idle");
   }, [updateStatus]);
 
-  return { status, error, activeAgent, toolEvents, connect, mute, endGracefully, disconnect };
+  return { status, error, activeAgent, toolEvents, connect, mute, endGracefully, disconnect, getTranscript: () => transcriptRef.current };
 }

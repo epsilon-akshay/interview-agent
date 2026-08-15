@@ -1,8 +1,17 @@
-import { useEffect, useRef, useState } from "react";
-import Editor from "@monaco-editor/react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import Editor, { type OnMount } from "@monaco-editor/react";
+import { RunPanel } from "./RunPanel";
+import { buildEvidenceObservation, runCode } from "./runner/runCode";
+import type { QuestionConfig, RunResult } from "./runner/types";
 import { useInterviewAgent } from "./useInterviewAgent";
+import { EMPTY_WHITEBOARD_SNAPSHOT, type WhiteboardPanelHandle, type WhiteboardSnapshot } from "./whiteboard/types";
+import { initialiseAgentClient } from "./orchestrator/client";
+import { buildInterviewPlan } from "./orchestrator/plan";
+import type { ActivityRow, InterviewPlan } from "./orchestrator/types";
 
 type Screen = "lobby" | "interview" | "finished";
+type TestMode = "off" | "checks" | "voice";
+type WhiteboardArtifacts = { image: string | null; scene: string | null };
 type Evaluation = {
   overallScore: number;
   recommendation: string;
@@ -13,6 +22,16 @@ type Evaluation = {
   limitations: string[];
 };
 
+const SHOW_DEMO_CONTROLS = true;
+const TEST_MODE_STORAGE_KEY = "signal-interview-test-mode";
+const WhiteboardPanel = lazy(() => import("./WhiteboardPanel").then((module) => ({ default: module.WhiteboardPanel })));
+
+const TEST_MODE_OPTIONS: { value: TestMode; label: string }[] = [
+  { value: "off", label: "No AI" },
+  { value: "checks", label: "AI checks" },
+  { value: "voice", label: "AI voice" }
+];
+
 const DEFAULT_RUBRIC = `Assess the candidate on:
 - Problem understanding and clarifying questions (20%)
 - Choice and explanation of approach (25%)
@@ -20,11 +39,11 @@ const DEFAULT_RUBRIC = `Assess the candidate on:
 - Time and space complexity analysis (15%)
 - Communication and response to feedback (15%)
 
-Do not score appearance, accent, personality, or confidence. Code correctness is a static-analysis estimate because code is not executed.`;
+Do not score appearance, accent, personality, or confidence. When test execution evidence is present, treat pass and fail counts as verified fact.`;
 
-const STARTER_CODE = `function firstNonRepeatingCharacter(input: string): number {
+const FALLBACK_STARTER = `function firstNonRepeatingCharacter(input: string): number {
   // Explain your approach while you work.
-  
+
   return -1;
 }`;
 
@@ -43,7 +62,8 @@ export default function App() {
   const [durationMinutes, setDurationMinutes] = useState(5);
   const [rubric, setRubric] = useState(DEFAULT_RUBRIC);
   const [question, setQuestion] = useState("The Introduction Agent will fetch the question from the server question bank.");
-  const [code, setCode] = useState(STARTER_CODE);
+  const [questionConfig, setQuestionConfig] = useState<QuestionConfig | null>(null);
+  const [code, setCode] = useState(FALLBACK_STARTER);
   const [revision, setRevision] = useState(0);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [micOn, setMicOn] = useState(true);
@@ -56,6 +76,18 @@ export default function App() {
   const [evaluationError, setEvaluationError] = useState("");
   const [evaluating, setEvaluating] = useState(false);
   const [error, setError] = useState("");
+  const [runResult, setRunResult] = useState<RunResult | null>(null);
+  const [running, setRunning] = useState(false);
+  const [runCollapsed, setRunCollapsed] = useState(false);
+  const [runTab, setRunTab] = useState<"tests" | "output">("tests");
+  const [workspaceTab, setWorkspaceTab] = useState<"code" | "whiteboard">("code");
+  const [whiteboardSnapshot, setWhiteboardSnapshot] = useState<WhiteboardSnapshot>(EMPTY_WHITEBOARD_SNAPSHOT);
+  const [plan, setPlan] = useState<InterviewPlan | null>(null);
+  const [activity, setActivity] = useState<ActivityRow[]>([]);
+  const [testMode, setTestMode] = useState<TestMode>(() => {
+    const saved = localStorage.getItem(TEST_MODE_STORAGE_KEY);
+    return saved === "off" || saved === "checks" ? saved : "voice";
+  });
   const videoRef = useRef<HTMLVideoElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -64,11 +96,31 @@ export default function App() {
   const revisionRef = useRef(revision);
   const sessionIdRef = useRef("");
   const timerTriggeredRef = useRef(false);
+  const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
+  const lastRunRef = useRef<RunResult | null>(null);
+  const mediaRef = useRef<MediaStream | null>(null);
+  const codeChangedAtRef = useRef(0);
+  const remainingRef = useRef(remaining);
+  const questionRef = useRef(question);
+  const planRef = useRef<InterviewPlan | null>(null);
+  const whiteboardRef = useRef<WhiteboardPanelHandle | null>(null);
+  const whiteboardSnapshotRef = useRef<WhiteboardSnapshot>(EMPTY_WHITEBOARD_SNAPSHOT);
+  const finalWhiteboardRef = useRef<WhiteboardArtifacts | null>(null);
   const agent = useInterviewAgent();
 
   codeRef.current = code;
   rubricRef.current = rubric;
   revisionRef.current = revision;
+  lastRunRef.current = runResult;
+  mediaRef.current = stream;
+  whiteboardSnapshotRef.current = whiteboardSnapshot;
+  remainingRef.current = remaining;
+  questionRef.current = question;
+
+  useEffect(() => {
+    localStorage.setItem(TEST_MODE_STORAGE_KEY, testMode);
+  }, [testMode]);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = stream;
@@ -81,10 +133,18 @@ export default function App() {
   }, [screen, agent.status]);
 
   useEffect(() => {
+    if (screen === "interview" && remaining === 15) void captureWhiteboardArtifacts();
+  }, [remaining, screen]);
+
+  useEffect(() => {
     if (screen !== "interview" || remaining !== 0 || timerTriggeredRef.current) return;
     timerTriggeredRef.current = true;
-    void agent.endGracefully("time_limit", durationMinutes * 60);
-  }, [remaining, screen, durationMinutes, agent]);
+    if (testMode === "off") {
+      endInterviewOff("time_limit");
+    } else {
+      void agent.endGracefully("time_limit", durationMinutes * 60);
+    }
+  }, [remaining, screen, durationMinutes, agent, testMode, stream]);
 
   useEffect(() => () => {
     stream?.getTracks().forEach((track) => track.stop());
@@ -108,17 +168,34 @@ export default function App() {
     setRecording(true);
   }
 
+  async function captureWhiteboardArtifacts() {
+    if (finalWhiteboardRef.current) return finalWhiteboardRef.current;
+    let image: string | null = null;
+    let scene: string | null = null;
+    try { image = await (whiteboardRef.current?.exportPng() ?? Promise.resolve(null)); } catch { /* scene summary remains available */ }
+    try { scene = await (whiteboardRef.current?.exportSceneJson() ?? Promise.resolve(null)); } catch { /* image and scene summary remain available */ }
+    const artifacts = { image, scene };
+    finalWhiteboardRef.current = artifacts;
+    return artifacts;
+  }
+
   async function evaluateInterview() {
     setEvaluating(true);
     setEvaluationError("");
     try {
+      const whiteboard = await captureWhiteboardArtifacts();
       const response = await fetch("/api/interview/evaluate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sessionId: sessionIdRef.current,
           candidate: candidate.trim(), role: role.trim(), question,
-          rubric: rubricRef.current, code: codeRef.current
+          rubric: rubricRef.current, code: codeRef.current,
+          transcript: agent.getTranscript().map((turn) => ({ role: turn.role, text: turn.text })),
+          whiteboardRevision: whiteboardSnapshotRef.current.revision,
+          whiteboardSummary: whiteboardSnapshotRef.current.summary,
+          whiteboardImage: whiteboard.image,
+          whiteboardScene: whiteboard.scene
         })
       });
       if (!response.ok) throw new Error((await response.text()).trim() || "Evaluation failed.");
@@ -130,13 +207,44 @@ export default function App() {
     }
   }
 
-  function finalizeInterview(media: MediaStream, reason: string) {
+  async function finalizeInterview(media: MediaStream, reason: string) {
     if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
     media.getTracks().forEach((track) => track.stop());
     setStream(null);
+    await captureWhiteboardArtifacts();
     setFinishReason(reason === "time_limit" ? "Time is up" : "Interview ended");
     setScreen("finished");
     void evaluateInterview();
+  }
+
+  function recordCoverage(areaId: string) {
+    setPlan((current) => {
+      if (!current) return current;
+      const next = {
+        areas: current.areas.map((area) =>
+          area.id === areaId ? { ...area, evidenceCount: area.evidenceCount + 1 } : area
+        )
+      };
+      planRef.current = next;
+      return next;
+    });
+  }
+
+  function endInterviewOff(reason: "time_limit" | "manual") {
+    const elapsed = Math.max(0, Math.round(durationMinutes * 60) - remaining);
+    void fetch("/api/interview/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: sessionIdRef.current, reason, elapsedSeconds: elapsed })
+    }).catch(() => undefined);
+    const media = mediaRef.current ?? stream;
+    if (media) void finalizeInterview(media, reason);
+  }
+
+  async function loadQuestionConfig(): Promise<QuestionConfig> {
+    const response = await fetch("/api/interview/question");
+    if (!response.ok) throw new Error("Question bank is unavailable.");
+    return await response.json() as QuestionConfig;
   }
 
   async function startInterview() {
@@ -145,6 +253,7 @@ export default function App() {
     if (!rubric.trim()) { setError("Add an interview rubric."); return; }
     if (!navigator.mediaDevices?.getUserMedia) { setError("Camera access requires a modern browser on localhost."); return; }
     try {
+      const config = await loadQuestionConfig();
       const media = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
         audio: { echoCancellation: true, noiseSuppression: true }
@@ -153,26 +262,74 @@ export default function App() {
       const sessionId = crypto.randomUUID();
       sessionIdRef.current = sessionId;
       timerTriggeredRef.current = false;
+      setQuestionConfig(config);
+      setCode(config.starterCode);
+      setRevision(0);
+      setRunResult(null);
+      setRunning(false);
+      setRunTab("tests");
+      setWorkspaceTab("code");
+      setPlan(null);
+      planRef.current = null;
+      setActivity([]);
+      finalWhiteboardRef.current = null;
+      whiteboardRef.current?.reset();
+      setWhiteboardSnapshot(EMPTY_WHITEBOARD_SNAPSHOT);
       setStream(media);
       setRemaining(durationSeconds);
       setMicOn(true);
       setCameraOn(true);
-      setQuestion("The Introduction Agent is fetching the question…");
+      remainingRef.current = durationSeconds;
+      questionRef.current = config.prompt;
+      setQuestion(testMode === "off" ? config.prompt : "The Introduction Agent is fetching the question…");
       setEvaluation(null);
       setEvaluationError("");
       setScreen("interview");
       startRecording(media);
+      if (testMode === "off") return;
+      void (async () => {
+        try {
+          await initialiseAgentClient();
+          const nextPlan = await buildInterviewPlan({
+            role: role.trim(),
+            rubric: rubricRef.current,
+            question: config.prompt,
+            durationSeconds
+          });
+          planRef.current = nextPlan;
+          setPlan(nextPlan);
+        } catch (planError) {
+          // The interview must still run without a plan.
+          console.warn("Interview plan unavailable", planError);
+        }
+      })();
       await agent.connect({
         sessionId,
         candidate: candidate.trim(),
         role: role.trim(),
         durationSeconds,
         media,
+        voiceEnabled: testMode === "voice",
         getRubric: () => rubricRef.current,
         getCode: () => codeRef.current,
         getCodeRevision: () => revisionRef.current,
-        onQuestion: setQuestion,
-        onFinished: (reason) => finalizeInterview(media, reason)
+        getLastRun: () => lastRunRef.current,
+        getWhiteboardRevision: () => whiteboardSnapshotRef.current.revision,
+        getWhiteboardChangedAt: () => whiteboardSnapshotRef.current.changedAt,
+        getWhiteboardSummary: () => whiteboardSnapshotRef.current.summary,
+        getWhiteboardImage: () => whiteboardRef.current?.exportPng() ?? Promise.resolve(null),
+        getCodeChangedAt: () => codeChangedAtRef.current,
+        getPlan: () => planRef.current,
+        getQuestionText: () => questionRef.current,
+        getRemainingSeconds: () => remainingRef.current,
+        getElapsedSeconds: () => durationSeconds - remainingRef.current,
+        onActivity: (row) => setActivity((rows) => [...rows.slice(-11), row]),
+        onObservation: (observation) => recordCoverage(observation.areaId),
+        onQuestion: (nextQuestion) => {
+          questionRef.current = nextQuestion;
+          setQuestion(nextQuestion);
+        },
+        onFinished: (reason) => { void finalizeInterview(media, reason); }
       });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not start the interview.");
@@ -192,20 +349,125 @@ export default function App() {
 
   function endInterview() {
     const elapsed = Math.max(0, Math.round(durationMinutes * 60) - remaining);
-    void agent.endGracefully("manual", elapsed);
+    if (testMode === "off") {
+      endInterviewOff("manual");
+    } else {
+      void agent.endGracefully("manual", elapsed);
+    }
   }
 
   function reset() {
     agent.disconnect();
     if (recordingUrl) URL.revokeObjectURL(recordingUrl);
     setRecordingUrl(null);
-    setCode(STARTER_CODE);
+    setQuestionConfig(null);
+    setCode(FALLBACK_STARTER);
     setRevision(0);
+    setRunResult(null);
+    setPlan(null);
+    planRef.current = null;
+    setActivity([]);
+    setWorkspaceTab("code");
+    finalWhiteboardRef.current = null;
+    whiteboardRef.current?.reset();
+    setWhiteboardSnapshot(EMPTY_WHITEBOARD_SNAPSHOT);
     setScreen("lobby");
+  }
+
+  const handleEditorMount: OnMount = (editor, monaco) => {
+    editorRef.current = editor;
+    monacoRef.current = monaco;
+  };
+
+  function loadDemoCode(next: string) {
+    setCode(next);
+    setRevision((current) => current + 1);
+    editorRef.current?.setValue(next);
+  }
+
+  function postRunEvidence(result: RunResult) {
+    void fetch("/api/interview/evidence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: sessionIdRef.current,
+        category: "code_execution",
+        observation: buildEvidenceObservation(result),
+        confidence: 1,
+        codeRevision: result.codeRevision
+      })
+    }).catch(() => undefined);
+  }
+
+  async function handleRun() {
+    if (running || !questionConfig) return;
+    const monaco = monacoRef.current;
+    const model = editorRef.current?.getModel();
+    if (!monaco || !model) {
+      setRunResult({
+        status: "fatal_error",
+        message: "Editor is not ready yet.",
+        warnings: [],
+        consoleOutput: [],
+        tests: [],
+        passedCount: 0,
+        totalCount: questionConfig.tests.length,
+        ranAt: Date.now(),
+        codeRevision: revisionRef.current
+      });
+      return;
+    }
+
+    setRunning(true);
+    setRunTab("tests");
+    try {
+      const result = await runCode({
+        monaco,
+        model,
+        entryFunction: questionConfig.entryFunction,
+        tests: questionConfig.tests,
+        codeRevision: revisionRef.current
+      });
+      setRunResult(result);
+      postRunEvidence(result);
+    } catch (reason) {
+      const result: RunResult = {
+        status: "fatal_error",
+        message: reason instanceof Error ? reason.message : "Run failed.",
+        warnings: [],
+        consoleOutput: [],
+        tests: [],
+        passedCount: 0,
+        totalCount: questionConfig.tests.length,
+        ranAt: Date.now(),
+        codeRevision: revisionRef.current
+      };
+      setRunResult(result);
+      postRunEvidence(result);
+    } finally {
+      setRunning(false);
+    }
   }
 
   return (
     <main className="app-shell">
+      <div className="test-bar">
+        <span className="test-bar-label">TEST MODE</span>
+        <div className="test-mode-toggle" role="group" aria-label="Test mode">
+          {TEST_MODE_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              className={testMode === option.value ? "active" : ""}
+              disabled={screen === "interview"}
+              onClick={() => setTestMode(option.value)}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        {screen === "interview" && <span className="test-bar-note">Applies on the next interview</span>}
+      </div>
       <header className="brand"><span className="brand-mark">S</span><span>Signal Interview</span><span className="local-pill">AGENTS SDK</span></header>
 
       {screen === "lobby" && (
@@ -238,16 +500,49 @@ export default function App() {
           <div className="workspace-grid">
             <section className="coding-column">
               <div className="question-card"><span>QUESTION BANK</span><p>{question}</p></div>
-              <div className="editor-shell">
-                <div className="editor-bar"><span>solution.ts</span><span>revision {revision}</span></div>
-                <Editor
-                  height="100%"
-                  language="typescript"
-                  theme="vs-dark"
-                  value={code}
-                  onChange={(value) => { setCode(value || ""); setRevision((current) => current + 1); }}
-                  options={{ minimap: { enabled: false }, fontSize: 14, lineHeight: 22, padding: { top: 18 }, automaticLayout: true }}
+              <div className="workspace-tabs" role="tablist" aria-label="Candidate workspace">
+                <button type="button" role="tab" aria-selected={workspaceTab === "code"} className={workspaceTab === "code" ? "active" : ""} onClick={() => setWorkspaceTab("code")}>Code</button>
+                <button type="button" role="tab" aria-selected={workspaceTab === "whiteboard"} className={workspaceTab === "whiteboard" ? "active" : ""} onClick={() => setWorkspaceTab("whiteboard")}>Whiteboard <small>{whiteboardSnapshot.elementCount}</small></button>
+              </div>
+              <div className={`code-workspace-pane ${workspaceTab === "code" ? "active" : ""}`} role="tabpanel">
+                {SHOW_DEMO_CONTROLS && questionConfig && (
+                  <div className="demo-strip">
+                    <span>⚙ DEMO</span>
+                    <button type="button" onClick={() => loadDemoCode(questionConfig.demo.solution)}>Load solution</button>
+                    <button type="button" onClick={() => loadDemoCode(questionConfig.demo.buggy)}>Load buggy</button>
+                  </div>
+                )}
+                <div className="editor-shell">
+                  <div className="editor-bar"><span>solution.ts</span><span>revision {revision}</span></div>
+                  <Editor
+                    height="100%"
+                    language="typescript"
+                    theme="vs-dark"
+                    value={code}
+                    onMount={handleEditorMount}
+                    onChange={(value) => { codeChangedAtRef.current = Date.now(); setCode(value || ""); setRevision((current) => current + 1); }}
+                    options={{ minimap: { enabled: false }, fontSize: 14, lineHeight: 22, padding: { top: 18 }, automaticLayout: true }}
+                  />
+                </div>
+                <RunPanel
+                  running={running}
+                  result={runResult}
+                  totalTests={questionConfig?.tests.length ?? 0}
+                  collapsed={runCollapsed}
+                  activeTab={runTab}
+                  onRun={() => void handleRun()}
+                  onToggleCollapsed={() => setRunCollapsed((value) => !value)}
+                  onTabChange={setRunTab}
                 />
+              </div>
+              <div className={`whiteboard-workspace-pane ${workspaceTab === "whiteboard" ? "active" : ""}`} role="tabpanel">
+                <div className="whiteboard-bar">
+                  <span>Explain your approach with shapes, arrows, and labels.</span>
+                  <small>revision {whiteboardSnapshot.revision}</small>
+                </div>
+                <Suspense fallback={<div className="whiteboard-loading">Loading whiteboard…</div>}>
+                  <WhiteboardPanel ref={whiteboardRef} onSnapshotChange={setWhiteboardSnapshot} />
+                </Suspense>
               </div>
             </section>
             <aside className="interview-sidebar">
@@ -258,14 +553,38 @@ export default function App() {
                 {recording && <div className="recording-badge"><span /> REC</div>}
               </div>
               <div className="agent-status-card">
-                <div className={`voice-orb ${agent.status}`}><span /><span /><span /></div>
-                <div><strong>{agent.status === "speaking" ? "Interviewer speaking" : agent.status === "thinking" ? "Agent thinking" : agent.status === "ending" ? "Closing interview" : agent.status === "listening" ? "Listening" : agent.status}</strong><p>{agent.activeAgent}</p></div>
+                <div className={`voice-orb ${testMode === "off" ? "" : agent.status}`}><span /><span /><span /></div>
+                <div>
+                  {testMode === "off" ? (
+                    <>
+                      <strong>AI disabled</strong>
+                      <p>Test mode — no voice agent</p>
+                    </>
+                  ) : (
+                    <>
+                      <strong>{agent.status === "speaking" ? "Interviewer speaking" : agent.status === "thinking" ? "Agent thinking" : agent.status === "ending" ? "Closing interview" : agent.status === "listening" ? "Listening" : agent.status}</strong>
+                      <p>{agent.activeAgent}</p>
+                    </>
+                  )}
+                </div>
               </div>
-              {agent.error && <div className="error voice-error">{agent.error}</div>}
-              <div className="tool-panel">
-                <div className="panel-title">AGENT TOOL CALLS</div>
-                {agent.toolEvents.length === 0 && <p className="empty-tools">Waiting for introduction tools…</p>}
-                {agent.toolEvents.map((event, index) => <div className="tool-row" key={`${event.name}-${event.at}-${index}`}><span className={event.state} /> <code>{event.name}</code><small>{event.state}</small></div>)}
+              {agent.error && testMode !== "off" && <div className="error voice-error">{agent.error}</div>}
+              {plan && (
+                <div className="coverage-panel">
+                  <div className="panel-title">RUBRIC COVERAGE</div>
+                  {plan.areas.map((area) => (
+                    <div className="coverage-row" key={area.id}>
+                      <div className="coverage-label"><span>{area.label}</span><small>{area.evidenceCount}</small></div>
+                      <div className="coverage-track"><span style={{ width: `${Math.min(100, (area.evidenceCount / 3) * 100)}%` }} /></div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="tool-panel activity-panel">
+                <div className="panel-title">AGENT ACTIVITY</div>
+                {testMode === "off" && <p className="empty-tools">AI is disabled in test mode.</p>}
+                {testMode !== "off" && activity.length === 0 && <p className="empty-tools">Waiting for planning activity…</p>}
+                {activity.map((row, index) => <div className={`activity-row activity-${row.type}`} key={`${row.at}-${index}`}><span /> <code>{row.text}</code></div>)}
               </div>
               <div className="controls compact" aria-label="Interview controls">
                 <button className={!micOn ? "control off" : "control"} onClick={toggleMic}><Icon name="mic" /><span>{micOn ? "Mute" : "Unmute"}</span></button>
@@ -281,8 +600,19 @@ export default function App() {
         <section className="finished">
           <div className="finish-icon">✓</div><div className="eyebrow">SESSION COMPLETE</div>
           <h1>{finishReason}.</h1>
-          <p>The agent closed the voice session gracefully and the backend recorded completion for session <code>{sessionIdRef.current.slice(0, 8)}</code>.</p>
-          {evaluating && <div className="evaluation-loading">Evaluation Manager is scoring the rubric…</div>}
+          <p>
+            {testMode === "off"
+              ? "Interview complete in test mode. The backend recorded completion for session "
+              : "The agent closed the voice session gracefully and the backend recorded completion for session "}
+            <code>{sessionIdRef.current.slice(0, 8)}</code>.
+          </p>
+          {evaluating && (
+            <div className="evaluation-loading">
+              {plan
+                ? plan.areas.map((area) => <div className="evaluation-skeleton" key={area.id}><span>{area.label}</span><small>scoring…</small></div>)
+                : "Evaluation Manager is scoring the rubric…"}
+            </div>
+          )}
           {evaluationError && <div className="error" role="alert">{evaluationError} <button className="text-button" onClick={() => void evaluateInterview()}>Retry</button></div>}
           {evaluation && (
             <section className="evaluation-report">
