@@ -40,18 +40,27 @@ The current system runs candidate code against browser-isolated checks. Test out
 │          └─────────────────┴────────────────┴──────────────────┘                   │
 │                                      │                                            │
 │                         OpenAI Agents SDK (TypeScript)                             │
-│                    RealtimeSession + specialist RealtimeAgents                    │
+│                                                                                   │
+│   Planning layer                        Voice layer                               │
+│   ├── Signal bus (no model calls)       RealtimeSession                           │
+│   ├── Interview planner                 + specialist RealtimeAgents               │
+│   ├── Analyst (observe + decide)        + zero-hint output guardrail              │
+│   └── Question queue ───────────────────▶ director message                        │
 │                         │                         │                                │
 └─────────────────────────┼─────────────────────────┼────────────────────────────────┘
-                          │ WebRTC audio            │ HTTPS tools
+                          │ WebRTC audio            │ HTTPS tools + model calls
                           ▼                         ▼
                 OpenAI Realtime API          Go application server
                                              ├── Static frontend
                                              ├── Client-secret minting
+                                             ├── OpenAI proxy (holds the API key)
+                                             ├── Model configuration
                                              ├── Question bank
                                              ├── Evidence persistence
                                              └── Completion persistence
 ```
+
+The planning layer and the voice layer are separate loops. The voice layer answers the candidate directly and is never blocked by planning. The planning layer decides what to ask proactively and hands the voice layer a finished question.
 
 ## 5. Technology choices
 
@@ -329,8 +338,13 @@ A ten-second fallback closes the session if final audio does not start or finish
 | `GET` | `/api/interview/question` | Load the active question text file |
 | `POST` | `/api/interview/evidence` | Persist a rubric evidence event |
 | `POST` | `/api/interview/complete` | Persist interview completion |
+| `POST` | `/api/interview/evaluate` | Generate the final structured report |
+| `POST` | `/api/openai/v1/*` | Proxy planning-layer model calls, injecting the API key |
+| `GET` | `/api/config` | Return observer and orchestrator model names from env |
 | `POST` | `/api/realtime/session` | Legacy/manual WebRTC SDP setup |
 | `POST` | `/api/local-voice/chat` | Local Codex CLI voice fallback |
+
+The proxy allows only `/v1/responses` and `/v1/chat/completions`. Any other path is rejected, so it cannot be used as an open relay. The browser sends the literal string `proxied-by-go-server` as its key; the real credential never leaves the server.
 
 ## 11. Data model
 
@@ -362,6 +376,22 @@ Stored in `runtime/evidence.jsonl`.
 
 Stored in `runtime/completions.jsonl`.
 
+### 11.3 Transcript turn
+
+```json
+{
+  "role": "candidate",
+  "text": "I'll count each character first, then scan for the first count of one.",
+  "at": 1755240000000
+}
+```
+
+Held in browser memory for the duration of the session. Sent to the Evaluation Manager at the end. Not persisted separately.
+
+Candidate speech comes from the `conversation.item.input_audio_transcription.completed` transport event, deduplicated by item id. Interviewer speech comes from `history_updated`. The raw transport event is used rather than `session.history` because the SDK has open defects where history returns empty or gets corrupted when the candidate speaks several times in succession.
+
+Transcription requires `audio.input.transcription` in the session config. Without it no transcript exists at all, and communication cannot be scored from anything but code.
+
 ## 12. Interview policy and guardrails
 
 The agent is configured as a neutral assessor rather than a coach.
@@ -384,7 +414,13 @@ It may:
 - Ask the candidate to test or explain their own reasoning.
 - Record evidence based on speech and code.
 
-The policy is prompt-enforced in the current version. A production version should add explicit input/output guardrails and automated policy evaluations.
+The policy is enforced in two places.
+
+Prompts state the rules. On top of that, the `RealtimeSession` carries a `zero_hint` output guardrail. It matches locally on the agent's generated text every ~100 characters, in parallel with speech. Because text generates faster than it is spoken, an unsafe turn is usually cut before the candidate hears it. It trips on algorithm and data-structure suggestions, correctness verdicts, praise, and code-shaped output.
+
+The guardrail uses local regexes only. It never makes a model call, because a network round trip per 100 characters would be slower than the speech it is meant to interrupt.
+
+A production version should add automated policy evaluations over recorded sessions.
 
 ## 13. Security and privacy
 
@@ -459,15 +495,41 @@ Additional production work:
 
 ## 18. Proactive workspace review
 
-The browser runs a 15-second workspace monitor after the Realtime session connects. It compares code and whiteboard revisions with the last reviewed pair. It triggers a review only when:
+The voice agent does not decide what to probe. A planning layer does, and hands it a finished question.
 
-- Code or whiteboard content changed.
-- Drawing stopped for at least two seconds.
-- The interview is not ending.
-- The active agent is listening rather than speaking or thinking.
-- No review is already active.
+### 18.1 Signal bus
 
-The browser attaches a bounded tldraw PNG when the board is non-empty. The trigger instructs the active agent to call `get_current_workspace` for exact code and a structured scene summary. The agent asks one terse question only when the change exposes a likely defect, contradiction, unexplained decision, or missing rubric signal. Unchanged work does not create model calls.
+A one-second tick watches the editor, the whiteboard, and test runs. It makes no model calls. It classifies activity into one of four signals: `code_changed`, `whiteboard_changed`, `tests_run`, or `silence`.
+
+Four gates run before any model call:
+
+- At least 45 seconds since the last question.
+- At least three seconds since the last keystroke, so the agent never interrupts mid-thought.
+- At least two seconds since the last whiteboard stroke.
+- The agent is listening, not speaking or thinking.
+- More than 20 seconds remain in the interview.
+
+A blocked signal is **deferred, not discarded**. It waits in `pendingSignal` until the gates open.
+
+A finished test run is recorded as evidence immediately, outside every gate. Pass and fail counts are machine facts, so they reach the report whether or not a question follows.
+
+### 18.2 Analyst
+
+One model call does two jobs: it records what changed, and it writes the next question. It reads the code diff, the whiteboard scene summary, the last test run, the recent transcript, rubric coverage, and the questions already asked.
+
+It is expected to return nothing. Most edits are not noteworthy, and silence is a valid decision.
+
+### 18.3 Precompute
+
+The analyst runs in the ten seconds before the 45-second gate opens, not on demand. Its result is parked. When a signal then fires, the question is already waiting.
+
+A parked question is discarded if the code revision has drifted by more than eight, or if it is older than 90 seconds. In that case the analyst runs live.
+
+This takes both model calls off the path the candidate waits on. A proactive question arrives in roughly four to five seconds instead of six to fourteen.
+
+### 18.4 Delivery
+
+The question reaches the voice agent as a director message containing the exact text to speak, plus the anchoring evidence for the agent's own understanding. No tool call is involved, so no realtime turn is spent fetching a string the browser already holds.
 
 The interviewer may challenge assumptions, request counterexamples and test edge cases indirectly. It must not deceive the candidate, invent constraints or contradict the supplied problem.
 
