@@ -2,191 +2,220 @@
 
 ## 1. Product summary
 
-Signal Interview is an automated, timed coding interviewer. It combines a live voice interviewer, browser code editor, whiteboard, rubric-driven evidence collection, proactive workspace observation, and a structured post-interview evaluation.
+Signal Interview is a timed technical interviewer. It combines a prepared interview guide, a code editor, browser checks, a whiteboard, optional voice, technical evidence, and an optional final rubric report.
 
-The product is intended for screening and hackathon demonstration. It supports human hiring decisions; it does not make an autonomous employment decision.
+The product supports human hiring decisions. It does not make an autonomous employment decision.
 
-## 2. Problem
+## 2. Users
 
-Technical screens require an interviewer to present a consistent problem, watch implementation progress, test conceptual understanding, avoid giving accidental hints, and write an evidence-based rubric afterward. This is time-consuming and varies by interviewer.
+- A candidate solves the problem and explains decisions.
+- An interview owner configures the role, interview, workspaces, and rubric.
+- A reviewer reads saved artifacts, evidence, recording, and any final report.
 
-Signal Interview standardizes this workflow while preserving an interactive conversation.
+## 3. Goals
 
-## 3. Users
+- Run a consistent interview from one reviewed setup.
+- Ask only problem, workspace, transcript, and rubric-based questions.
+- Avoid hints, solutions, praise, coaching, and unsupported verdicts.
+- Preserve verified browser test facts separately from model judgment.
+- Save final candidate work before recording completion.
+- Let a reviewer retry failed evidence, completion, or evaluation writes.
 
-- Candidate: solves the problem, writes code, and explains decisions.
-- Interview owner: configures the role, duration, and rubric.
-- Reviewer: reads the final evidence-backed evaluation and recording.
+## 4. Non-goals
 
-## 4. Goals
+- Production isolation for untrusted code.
+- Automated hiring or rejection.
+- Judging appearance, accent, personality, emotion, confidence, or protected traits.
+- Tutoring, model answers, or misleading constraints.
+- Public or multi-tenant deployment without more security controls.
 
-- Conduct a complete local video and voice coding interview.
-- Ask only problem- and rubric-relevant questions.
-- Proactively inspect meaningful code and whiteboard changes without waiting for the candidate.
-- Keep interviewer speech terse, demanding, and non-coaching.
-- Produce a readable, evidence-backed final rubric report.
-- Separate verified browser test results from model judgment.
+## 5. Runtime modes
 
-## 5. Non-goals
+The developer test bar appears only when `INTERVIEW_DEVELOPER_MODE=true`.
 
-- Production-grade sandboxing of untrusted candidate code.
-- Automated hiring or rejection without human review.
-- Judging appearance, accent, personality, emotion, or protected traits.
-- Providing tutoring, hints, solutions, or model answers.
-- Misleading the candidate or inventing problem constraints.
+| Mode | Candidate experience | AI and network behavior | Result |
+|---|---|---|---|
+| AI checks | Editor, whiteboard, and text planner questions | Uses preparation, planner, and evaluation models. No Realtime or media. | Saved facts and an evaluation report. |
+| AI voice | Full spoken interview, editor, whiteboard, and local recording | Uses preparation, planner, Realtime, and evaluation. | Saved facts, recording download, and an evaluation report. |
+
+The production frontend includes Monaco, Monaco workers, tldraw, fonts, and icons.
 
 ## 6. Core experience
 
 ### 6.1 Setup
 
-The interview owner provides candidate name, role, time limit, and rubric. The default duration is five minutes. Start is blocked if candidate name or rubric is empty or media permissions fail.
+The owner reviews a candidate name, role, interview type, five-minute default duration, question types, TypeScript workspace, channels, brief, and rubric. Behavioral interviews do not keep coding defaults. Later explicit owner edits remain where they are compatible.
 
-Before start, the setup UI saves one validated `InterviewSetup` v1 snapshot. It can include the interview type, question types, coding language, enabled workspaces, candidate tools, interview channels, brief, structured rubric, and reviewed candidate information. AI chat is a candidate tool for implementation work in the code editor. It is not an interview channel. Uploaded files remain private runtime artifacts. The UI reuses the setup ID as the interview session ID. The current conducting layer does not read the saved snapshot. Candidate information only tailors job-related questions when a later conducting-layer integration uses it. It does not count as scoring evidence or change rubric weights.
+The browser allocates a setup ID before its first upload. It uploads private files, then saves one immutable `InterviewSetup` v1 snapshot. A retry reuses the same ID and any successful phase.
 
-### 6.2 Introduction
+The server creates one AI-prepared guide. It can fill missing job content. It cannot change identity, duration, interview type, workspace access, or explicit rubric weights.
 
-Before substantive speech, the Introduction Agent must retrieve interview context, fetch the problem from the server question bank, and read the configured rubric. It states the candidate name and time limit, presents the problem, asks for the candidate's understanding, and hands off.
+An identical preparation retry returns the saved guide. A malformed saved guide returns `422`.
 
-### 6.3 Interview
+### 6.2 Startup
 
-The Coding Interviewer asks one short question at a time, normally under 12 words. It does not explain its question, repeat the candidate's response, use filler, praise, reassure, coach, or answer unrelated questions.
+AI checks initializes its text planner. AI voice then gets media, reads model configuration, mints a short-lived token, and connects a muted Realtime session.
 
-Questions must derive from the problem, current code, or rubric. Valid challenge techniques include asking for proof, requesting a counterexample, questioning an assumption, testing an invariant, or introducing a valid edge case. The interviewer must not state false facts, invent requirements, or deliberately deceive the candidate.
+The interview screen and timer start only after the selected runtime is ready. Voice recording starts only after media and Realtime connection succeed. A startup failure closes the session, stops media, discards the recorder and recording URL, and keeps the setup screen visible.
 
-### 6.4 Candidate workspace and proactive review
+### 6.3 Voice introduction
 
-The candidate can switch between a Monaco editor and a tldraw whiteboard without losing either artifact. The whiteboard supports text, shapes, arrows, and freehand drawing. Code can run against visible browser-isolated checks.
+Application code forces these tools in order:
 
-The interviewer does not choose what to probe. A planning layer does, and hands it a finished question.
+1. interview context
+2. prepared question
+3. prepared rubric
 
-A one-second monitor watches the editor, whiteboard, and test runs without calling any model. Before a question can be asked, five conditions must hold: 45 seconds since the last question, three seconds since the last keystroke, two seconds since the last whiteboard stroke, the agent is listening, and more than 20 seconds remain. A blocked signal waits rather than being discarded.
+Every tool-choice change waits for a Realtime session acknowledgement. The Introduction Agent cannot begin substantive speech until all three tools succeed.
 
-A single analysis call then records what changed and writes the next question. It runs in the ten seconds before the gate opens, so the question is usually ready before it is needed. A question arrives roughly four to five seconds after the trigger.
+The Introduction Agent remains active until the approved primary question finishes playback. The app then switches to the Interview Conductor, waits for automatic tool choice with conductor tools, unmutes candidate input, and starts the 45-second planner clock.
 
-Test results are recorded as evidence immediately, outside every gate, because pass and fail counts are facts rather than judgements.
+Out-of-order calls do not advance startup. A bounded timeout closes the session once and shows a retryable error.
 
-This mechanism observes Monaco artifacts, tldraw artifacts, test output, and the spoken transcript. It does not capture video, browser chrome, or unrelated screen content.
+### 6.4 Interview policy
 
-### 6.5 Speech capture
+The interviewer asks one short question at a time. Planner questions contain one question mark at most and no more than 12 words.
 
-The session transcribes candidate speech. Transcript turns feed the analysis call during the interview and the final report afterwards.
+Questions can ask for a proof, counterexample, assumption, invariant, edge case, test, or tradeoff. They must derive from the approved prompt, current workspace, transcript, or rubric.
 
-Communication and problem understanding are scored primarily from the candidate's own words. When no transcript exists, that is recorded as an evidence gap rather than inferred from code.
+The interviewer must not:
 
-### 6.6 Completion
+- reveal code, pseudocode, a solution, or a leading hint
+- name a solution algorithm or data structure absent from the approved prompt
+- praise, reassure, coach, prescribe, or apologize
+- claim that an unverified approach is correct or incorrect
+- judge personality, appearance, accent, emotion, confidence, hesitation, uncertainty, friendliness, or hostility
+- invent a requirement or deceive the candidate
 
-At zero seconds, the frontend prevents duplicate timer handling, marks the session as ending, mutes candidate audio, interrupts current output, records completion on the backend, and asks the active agent to say only that time is up. It closes after final audio or a ten-second fallback timeout. Manual ending follows the same flow.
+One shared local validator applies these rules to planner questions, planner findings, and Realtime output. Rejected assistant output stays out of the transcript, planner, and evaluation.
 
-### 6.7 Evaluation Manager
+### 6.5 Workspace and planner
 
-After the voice session closes, the frontend sends candidate metadata, problem, rubric, final code, final whiteboard scene, scene summary, and PNG to the backend. The backend loads session evidence and calls a Codex model through the Responses API with a strict JSON schema.
+The candidate can switch between enabled Code and Whiteboard tabs without losing content. Disabled workspaces expose no candidate UI, agent tool, or planner input for that workspace. Server-private solution and buggy fixtures never appear in the candidate UI or prepared response.
 
-The report contains:
+A one-second signal bus watches code, whiteboard, tests, transcript, timing, rubric coverage, asked questions, stage, and agent status. A question can dispatch only when:
 
-- Overall score from 0–100
-- Recommendation: strong hire, hire, mixed, no hire, or insufficient evidence
-- Concise summary
-- Per-category score, weight, supporting evidence, and evidence gaps
-- Strengths, risks, and assessment limitations
+- 45 seconds passed since the most recently confirmed question delivery
+- code was quiet for three seconds
+- the whiteboard was quiet for two seconds
+- the agent is listening
+- more than 20 seconds remain
 
-Missing evidence lowers confidence and may result in `insufficient_evidence`. The report treats browser test outcomes as verified when present. It treats other correctness claims as model judgment. An empty whiteboard causes no penalty unless the rubric requires diagramming.
+A blocked signal remains pending. Analysis does not run during speech, thought, typing, or drawing.
+
+The planner invalidates work after any material input change. It checks a complete input fingerprint and all five gates after every awaited model or evidence operation. A stale result creates no question, evidence, or activity. A null precompute still counts as the one attempt for that gate window.
+
+### 6.6 Evidence
+
+One browser test run creates one durable `code_execution` event. Planner evidence uses an exact prepared rubric criterion ID. Every evidence request contains:
+
+- `sessionId`
+- a stable 32-character lowercase-hex `eventId`
+- `category`
+- a nonempty `observation`
+- `confidence` from zero to one
+- analyzed `codeRevision`
+- analyzed `whiteboardRevision`
+
+A retry sends the exact ID and payload. Rubric coverage increases only after the server acknowledges persistence. A failed write shows a retry action.
+
+### 6.7 Completion
+
+Manual and timer endings use one shared guard. The first request fixes reason and elapsed time. A retry sends that exact payload.
+
+The browser first captures the latest code and a revision-stable whiteboard. It stores immutable final artifacts. It then records completion. A success claim appears only after both writes succeed.
+
+Whiteboard capture compares its revision before and after scene and PNG export. It retries a bounded number of times and never replaces newer data with an older capture.
+
+Voice mode then plays one closing line when bootstrap already finished. Ending during bootstrap closes at once. AI checks does not wait for audio.
+
+### 6.8 Evaluation
+
+AI checks and AI voice evaluate after artifacts and completion exist.
+
+The browser sends only `sessionId` and transcript. The server loads candidate identity, the prepared question and rubric, evidence, completion, and immutable final code and whiteboard. The browser cannot replace those inputs.
+
+The model returns judgment fields for each prepared criterion. The server restores names and weights, rejects missing or invented criteria, and calculates the weighted score. Browser test outcomes remain verified facts. Other correctness claims remain model judgments.
+
+An identical retry returns the stored report without another model call. A retry with a different transcript returns `409`.
 
 ## 7. Functional requirements
 
 | ID | Requirement |
 |---|---|
-| FR-1 | Capture camera and microphone with browser permission. |
-| FR-2 | Display candidate video and record the local media stream. |
-| FR-3 | Provide a Monaco TypeScript editor with revision tracking and browser-isolated checks. |
-| FR-4 | Establish a Realtime speech-to-speech session using an ephemeral token. |
-| FR-5 | Load the question from `questions/default.json` through a tool call. |
-| FR-6 | Read the UI rubric through a tool call before substantive interviewing. |
-| FR-7 | Inspect current editor text, execution results, and whiteboard summary through explicit tools. |
-| FR-8 | Persist rubric evidence with category, observation, confidence, and revision. |
-| FR-9 | Gate proactive questions behind deterministic checks and never interrupt active typing. |
-| FR-10 | Enforce a configurable timer and graceful terminal sequence. |
-| FR-11 | Generate and render a schema-validated final evaluation. |
-| FR-12 | Allow evaluation retry without repeating the interview. |
-| FR-13 | Preserve Code and Whiteboard tab content throughout an interview. |
-| FR-14 | Send a whiteboard PNG to live and final multimodal evaluation only when the board is non-empty. |
-| FR-15 | Transcribe candidate speech and supply it to live analysis and the final evaluation. |
-| FR-16 | Validate and save a versioned interview setup snapshot before interview start. |
-| FR-17 | Store uploaded interview briefs, rubrics, and candidate files as private runtime artifacts. |
+| FR-1 | Save one versioned setup and prepared guide before an interview starts. |
+| FR-2 | Keep uploads, verified fixtures, prepared guides, artifacts, and reports private on the server. |
+| FR-3 | Support AI checks and AI voice with the boundaries in this specification. |
+| FR-4 | Provide enabled Monaco and tldraw workspaces with revision tracking. |
+| FR-5 | Run TypeScript checks in a browser worker and persist one fact per run. |
+| FR-6 | Enforce the ordered Realtime bootstrap and confirmed playback handoff. |
+| FR-7 | Gate proactive questions behind all timing, activity, and agent-state checks. |
+| FR-8 | Validate every planner and Realtime output through one safety policy. |
+| FR-9 | Persist retry-safe evidence with code and whiteboard revisions. |
+| FR-10 | Persist current final artifacts before completion. |
+| FR-11 | Keep one exact completion payload across retries. |
+| FR-12 | Accept only session ID and transcript from the browser for evaluation. |
+| FR-13 | Assemble rubric metadata and the weighted score on the server. |
+| FR-14 | Return a stored evaluation for an identical retry. |
 
-## 8. Interview policy
+## 8. Security and privacy
 
-The interviewer must:
+- The server defaults to `127.0.0.1:8080`.
+- A key-bearing server needs `INTERVIEW_ALLOW_UNSAFE_NETWORK_BIND=true` for a non-loopback bind.
+- Browser mutation requests must have the same origin.
+- Paid endpoints have concurrency and rate protection.
+- The permanent Platform API key stays on the server.
+- Runtime directories and files use owner-only permissions before writes.
+- Agents SDK tracing is disabled.
+- Local recordings remain in browser memory until downloaded or discarded.
+- Runtime data must not be committed or shared.
 
-- Stay within the supplied problem, code, and rubric.
-- Ask one terse, precise question at a time.
-- Prefer evidence-seeking questions over explanations.
-- Record only observable technical evidence.
-- Distinguish browser test evidence from model judgment.
+The app has no user authentication. The unsafe network flag is not a production deployment mode.
 
-The interviewer must not:
+Local HTTP use needs no tldraw production license key. Hosted HTTPS use needs a valid `VITE_TLDRAW_LICENSE_KEY`.
 
-- Reveal an algorithm, data structure, code, pseudocode, partial solution, or leading hint.
-- Validate whether the candidate is correct.
-- Praise, reassure, apologize, or provide coaching.
-- Assess appearance, accent, personality, confidence, or emotion.
-- Manufacture ambiguity or lie to confuse the candidate.
+## 9. Failure behavior
 
-## 9. Evaluation categories
+- Setup or preparation failure keeps the setup screen and retained startup progress.
+- Media, config, token, or connection failure rolls back all partial voice state.
+- Bootstrap timeout closes once and shows a retryable startup error.
+- Evidence failure leaves coverage unchanged and shows a retry action.
+- Artifact or completion failure keeps the exact pending payload and shows a retry action.
+- Evaluation failure keeps the completed interview and shows a retry action.
+- Missing evidence creates an explicit gap. It does not create an invented observation.
 
-The default rubric weights are:
+## 10. Success measures
 
-- Problem understanding and clarifying questions: 20%
-- Choice and explanation of approach: 25%
-- Code quality and likely correctness: 25%
-- Time and space complexity analysis: 15%
-- Communication and response to feedback: 15%
+- Every substantive question traces to approved interview input.
+- No planner or voice output leaks a hint, solution, coaching, unsupported verdict, or personal judgment in policy tests.
+- Active typing or drawing prevents a proactive question.
+- One test run produces one durable fact.
+- A finished claim always follows acknowledged artifact and completion writes.
+- Every scored criterion contains concrete evidence or an explicit gap.
 
-Custom rubric text is supported. The Evaluation Manager must reflect configured criteria and must not invent new scored dimensions.
+## 11. Acceptance criteria
 
-## 10. Success metrics
+1. Startup retries reuse one setup ID and successful phases.
+2. Voice bootstrap forces context, question, and rubric in order.
+3. Candidate input stays muted until the primary question completes and conductor configuration is acknowledged.
+4. Code and whiteboard content survive tab changes.
+5. Disabled workspaces remove their UI, tools, and planner data.
+6. A question dispatches only after all five gates pass.
+7. Material changes discard stale analysis before evidence or question creation.
+8. Unsafe analyst or Realtime output never enters the transcript or evaluation.
+9. One run creates one retry-safe evidence event.
+10. Ending stores the latest code and whiteboard before completion.
+11. Completion races create one terminal record and one truthful finished state.
+12. Evaluation rejects browser-supplied artifacts or rubric fields.
+13. An identical evaluation retry makes no second provider call.
+14. Removed chat, local question, and manual Realtime session routes return `404`.
 
-- 100% of substantive questions are traceable to the problem, code, or rubric in review samples.
-- Median interviewer utterance is one sentence and under 12 spoken words after introduction.
-- No overlapping workspace review starts while the agent is speaking or thinking.
-- Every completed session returns a report or a visible retryable error.
-- Every category score includes evidence or an explicit evidence gap.
-- Zero hints, solutions, or unsupported runtime-correctness claims in policy evaluations.
+## 12. Future scope
 
-## 11. Failure behavior
-
-- Realtime token failure: remain on setup or show an interview error without exposing the API key.
-- Question-bank failure: stop introduction and show the tool error.
-- Evidence write failure: expose the tool failure; do not silently claim persistence.
-- Evaluation failure: keep the completed interview and show a retry action.
-- Final audio failure: force-close after ten seconds.
-- Missing evidence: return a low-confidence or insufficient-evidence report, never fabricate observations.
-
-## 12. Privacy and safety
-
-- The Platform API key remains on the Go server; only an ephemeral Realtime secret reaches the browser.
-- Local recordings remain in browser memory until saved or discarded.
-- Runtime JSONL files and whiteboard artifacts contain private assessment data. They must not be committed or publicly shared.
-- Camera frames and unrelated screen content are excluded from model inputs.
-- Production deployment requires consent, retention controls, authentication, authorization, encryption, auditability, and applicable employment-law review.
-
-## 13. Acceptance criteria
-
-1. Starting an interview presents the server-controlled problem after all mandatory setup tools complete.
-2. Code and Whiteboard tabs preserve their content.
-3. Editing code or drawing produces a question only after typing stops and the question gate opens.
-4. Unchanged workspace content does not cause repeated review prompts.
-5. Interviewer answers remain terse and never provide a hint or solution.
-6. Timer expiry produces one time-up announcement and one completion record.
-7. The finished screen renders overall and category scores with evidence and gaps.
-8. Evaluation failure presents a retry button and does not lose the recording link.
-9. Final evaluation receives the code, test evidence, whiteboard summary, and whiteboard PNG.
-10. An empty whiteboard causes no default penalty.
-
-## 14. Future scope
-
-- Evidence links to exact transcript utterances with stable ids
-- Recruiter-managed question and rubric banks
-- Shared or collaborative whiteboards
-- Persistent database storage and authenticated reviewer portal
-- Prompt-policy regression tests and calibrated evaluator benchmarks
+- Authentication and per-session authorization
+- Tenant isolation
+- Database and object storage
+- Recording consent, retention, export, and deletion controls
+- Production sandboxing for untrusted code
 - Human score overrides and reviewer notes
+- Automated policy and score calibration against human review

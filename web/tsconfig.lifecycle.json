@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "rootDir": "src",
+    "outDir": "tests/.compiled",
+    "noEmit": false
+  },
+  "include": [
+    "src/orchestrator/lifecycle.ts",
+    "src/orchestrator/guardrails.ts",
+    "src/orchestrator/outputSafety.ts",
+    "src/orchestrator/questionDelivery.ts",
+    "src/orchestrator/realtimeBootstrap.ts",
+    "src/orchestrator/signalBus.ts",
+    "src/orchestrator/analyse.ts",
+    "src/orchestrator/client.ts",
+    "src/orchestrator/observers.ts",
+    "src/orchestrator/types.ts",
+    "src/runner/types.ts",
+    "src/runtimeContracts.ts",
+    "src/setup/types.ts"
+  ]
+}

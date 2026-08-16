@@ -80,8 +80,8 @@ type setupBrief struct {
 
 type setupRubric struct {
 	Criteria      []rubricCriterion `json:"criteria"`
-	SourceText    string            `json:"sourceText,omitempty"`
-	AttachmentIDs []string          `json:"attachmentIds,omitempty"`
+	SourceText    string            `json:"sourceText"`
+	AttachmentIDs []string          `json:"attachmentIds"`
 }
 
 type rubricCriterion struct {
@@ -118,6 +118,10 @@ func interviewSetupsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := normalizeInterviewSetup(&setup); err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
 	if err := validateInterviewSetup(setup); err != nil {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
@@ -125,7 +129,12 @@ func interviewSetupsHandler(w http.ResponseWriter, r *http.Request) {
 	stored := storedInterviewSetup{ID: setup.SetupID, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Setup: setup}
 	if err := saveSetup(stored); err != nil {
 		if errors.Is(err, errSetupExists) {
-			http.Error(w, "interview setup already exists", http.StatusConflict)
+			existing, loadErr := loadSetup(setup.SetupID)
+			if loadErr == nil && sameInterviewSetup(existing.Setup, setup) {
+				writeJSON(w, http.StatusOK, existing)
+				return
+			}
+			http.Error(w, "a different interview setup already uses this setup id", http.StatusConflict)
 			return
 		}
 		http.Error(w, "could not save interview setup", http.StatusInternalServerError)
@@ -134,17 +143,28 @@ func interviewSetupsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, stored)
 }
 
+func sameInterviewSetup(left, right interviewSetup) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+}
+
 func interviewSetupHandler(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/interview/setups/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 2 && parts[1] == "prepare" {
+		interviewPreparationHandler(w, r, parts[0])
+		return
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/interview/setups/")
-	if id == "" || strings.Contains(id, "/") || !safeID.MatchString(id) {
+	if len(parts) != 1 || !safeID.MatchString(parts[0]) {
 		http.Error(w, "invalid setup id", http.StatusBadRequest)
 		return
 	}
-	stored, err := loadSetup(id)
+	stored, err := loadSetup(parts[0])
 	if errors.Is(err, os.ErrNotExist) {
 		http.Error(w, "interview setup not found", http.StatusNotFound)
 		return
@@ -207,7 +227,7 @@ func interviewUploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	directory := uploadDirectory(setupID)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := ensurePrivateRuntimeDirectory(directory); err != nil {
 		http.Error(w, "could not store upload", http.StatusInternalServerError)
 		return
 	}
@@ -282,10 +302,10 @@ func validateInterviewSetup(setup interviewSetup) error {
 			return err
 		}
 	}
-	if err := requiredText("role.title", setup.Role.Title, 200); err != nil {
+	if err := optionalText("role.title", setup.Role.Title, 200); err != nil {
 		return err
 	}
-	if err := requiredText("role.level", setup.Role.Level, 100); err != nil {
+	if err := optionalText("role.level", setup.Role.Level, 100); err != nil {
 		return err
 	}
 	if err := requiredText("interview.type", setup.Interview.Type, 100); err != nil {
@@ -302,14 +322,17 @@ func validateInterviewSetup(setup interviewSetup) error {
 			return err
 		}
 	}
-	if err := uniqueTextList("interview.questionTypes", setup.Interview.QuestionTypes, 1, 10, 100); err != nil {
+	if containsText(setup.Interview.Workspaces, "code_editor") && setup.Interview.CodingLanguage != "" && !strings.EqualFold(strings.TrimSpace(setup.Interview.CodingLanguage), "typescript") {
+		return fmt.Errorf("interview.codingLanguage must be TypeScript when code_editor is enabled")
+	}
+	if err := uniqueTextList("interview.questionTypes", setup.Interview.QuestionTypes, 0, 10, 100); err != nil {
 		return err
 	}
 	if err := allowedTextList("interview.workspaces", setup.Interview.Workspaces, []string{"code_editor", "whiteboard"}, 0); err != nil {
 		return err
 	}
-	if err := allowedTextList("interview.tools", setup.Interview.Tools, []string{"ai_chat"}, 0); err != nil {
-		return err
+	if len(setup.Interview.Tools) != 0 {
+		return fmt.Errorf("interview.tools must be empty; AI chat is not available")
 	}
 	if err := allowedTextList("interview.channels", setup.Interview.Channels, []string{"voice"}, 1); err != nil {
 		return err
@@ -320,24 +343,22 @@ func validateInterviewSetup(setup interviewSetup) error {
 	if err := attachmentIDsValid(setup.SetupID, "brief.attachmentIds", setup.Brief.AttachmentIDs, "brief"); err != nil {
 		return err
 	}
-	if strings.TrimSpace(setup.Brief.Text) == "" && len(setup.Brief.AttachmentIDs) == 0 {
-		return fmt.Errorf("brief requires text or an attachment")
-	}
 	if len(setup.Rubric.SourceText) > 100000 {
 		return fmt.Errorf("rubric.sourceText exceeds the 100 KB limit")
 	}
-	if len(setup.Rubric.Criteria) == 0 || len(setup.Rubric.Criteria) > 20 {
-		return fmt.Errorf("rubric.criteria must contain between 1 and 20 criteria")
+	if len(setup.Rubric.Criteria) > 20 {
+		return fmt.Errorf("rubric.criteria must contain at most 20 criteria")
 	}
 	weights, ids := 0, map[string]bool{}
 	for index, criterion := range setup.Rubric.Criteria {
 		if err := requiredText(fmt.Sprintf("rubric.criteria[%d].id", index), criterion.ID, 100); err != nil {
 			return err
 		}
-		if ids[criterion.ID] {
+		key := canonicalRubricID(criterion.ID)
+		if ids[key] {
 			return fmt.Errorf("rubric.criteria contains duplicate id %q", criterion.ID)
 		}
-		ids[criterion.ID] = true
+		ids[key] = true
 		if err := requiredText(fmt.Sprintf("rubric.criteria[%d].name", index), criterion.Name, 200); err != nil {
 			return err
 		}
@@ -349,10 +370,38 @@ func validateInterviewSetup(setup interviewSetup) error {
 		}
 		weights += criterion.Weight
 	}
-	if weights != 100 {
+	if len(setup.Rubric.Criteria) > 0 && weights != 100 {
 		return fmt.Errorf("rubric.criteria weights must total 100")
 	}
 	return attachmentIDsValid(setup.SetupID, "rubric.attachmentIds", setup.Rubric.AttachmentIDs, "rubric")
+}
+
+func canonicalRubricID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
+}
+
+// normalizeInterviewSetup creates the one canonical rubric identifier form that
+// every later guide, evidence, and evaluation boundary uses.
+func normalizeInterviewSetup(setup *interviewSetup) error {
+	seen := make(map[string]bool, len(setup.Rubric.Criteria))
+	for index := range setup.Rubric.Criteria {
+		id := canonicalRubricID(setup.Rubric.Criteria[index].ID)
+		if id != "" && seen[id] {
+			return fmt.Errorf("rubric.criteria contains duplicate id %q", setup.Rubric.Criteria[index].ID)
+		}
+		if id != "" {
+			seen[id] = true
+		}
+		setup.Rubric.Criteria[index].ID = id
+	}
+	return nil
+}
+
+func optionalText(field, value string, maximum int) error {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return requiredText(field, value, maximum)
 }
 
 func requiredText(field, value string, maximum int) error {
@@ -487,7 +536,7 @@ func uploadDirectory(setupID string) string { return filepath.Join(setupDirector
 
 func saveSetup(stored storedInterviewSetup) error {
 	directory := setupDirectory(stored.ID)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := ensurePrivateRuntimeDirectory(directory); err != nil {
 		return err
 	}
 	path := filepath.Join(directory, "setup.json")
@@ -542,6 +591,9 @@ func writePrivateJSON(path string, value any) error {
 }
 
 func writePrivateJSONAtomic(path string, value any) error {
+	if err := ensurePrivateRuntimeDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
 	raw, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err

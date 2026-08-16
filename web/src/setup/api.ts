@@ -6,10 +6,21 @@ type UploadedFile = {
   id: string;
 };
 
-function newSetupId() {
+export type SetupSaveProgress = {
+  setupId: string;
+  uploads: Partial<Record<"brief" | "rubric" | "resume", UploadedFile | null>>;
+  uploadPromises: Partial<Record<"brief" | "rubric" | "resume", Promise<UploadedFile | null>>>;
+  setupSaved: boolean;
+};
+
+export function newSetupId() {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+export function createSetupSaveProgress(setupId = newSetupId()): SetupSaveProgress {
+  return { setupId, uploads: {}, uploadPromises: {}, setupSaved: false };
 }
 
 async function uploadFile(setupId: string, kind: UploadKind, file: File): Promise<UploadedFile> {
@@ -28,12 +39,23 @@ function optionalHttpsSource(type: "linkedin" | "github" | "website", reference:
   return value ? { type, reference: value } : null;
 }
 
-export async function saveInterviewSetup(draft: InterviewSetupDraft) {
-  const setupId = newSetupId();
+export async function saveInterviewSetup(draft: InterviewSetupDraft, progress = createSetupSaveProgress()) {
+  const setupId = progress.setupId;
+  async function retainedUpload(key: "brief" | "rubric" | "resume", kind: UploadKind, file: File | null) {
+    if (key in progress.uploads) return progress.uploads[key] ?? null;
+    if (progress.uploadPromises[key]) return progress.uploadPromises[key];
+    if (!file) { progress.uploads[key] = null; return null; }
+    const promise = uploadFile(setupId, kind, file).then((uploaded) => {
+      progress.uploads[key] = uploaded;
+      return uploaded;
+    }).finally(() => { delete progress.uploadPromises[key]; });
+    progress.uploadPromises[key] = promise;
+    return promise;
+  }
   const [briefUpload, rubricUpload, resumeUpload] = await Promise.all([
-    draft.briefFile ? uploadFile(setupId, "brief", draft.briefFile) : Promise.resolve(null),
-    draft.rubricFile ? uploadFile(setupId, "rubric", draft.rubricFile) : Promise.resolve(null),
-    draft.resumeFile ? uploadFile(setupId, "candidate", draft.resumeFile) : Promise.resolve(null)
+    retainedUpload("brief", "brief", draft.briefFile),
+    retainedUpload("rubric", "rubric", draft.rubricFile),
+    retainedUpload("resume", "candidate", draft.resumeFile)
   ]);
 
   const sources = [
@@ -43,6 +65,7 @@ export async function saveInterviewSetup(draft: InterviewSetupDraft) {
     optionalHttpsSource("website", draft.websiteUrl)
   ].filter((source): source is { type: string; reference: string } => source !== null);
 
+  if (progress.setupSaved) return { setupId };
   const response = await fetch("/api/interview/setups", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -65,7 +88,7 @@ export async function saveInterviewSetup(draft: InterviewSetupDraft) {
         codingLanguage: draft.codingLanguage.trim(),
         questionTypes: draft.questionTypes,
         workspaces: draft.workspaces,
-        tools: draft.tools,
+        tools: [],
         channels: draft.channels
       },
       brief: {
@@ -84,6 +107,11 @@ export async function saveInterviewSetup(draft: InterviewSetupDraft) {
       }
     })
   });
+  if (response.status === 409) {
+    const existing = await fetch(`/api/interview/setups/${setupId}`);
+    if (existing.ok) { progress.setupSaved = true; return { setupId }; }
+  }
   if (!response.ok) throw new Error((await response.text()).trim() || "Could not save interview setup.");
+  progress.setupSaved = true;
   return { setupId };
 }

@@ -10,10 +10,6 @@ export type QuestionConfig = {
   prompt: string;
   starterCode: string;
   tests: QuestionTest[];
-  demo: {
-    solution: string;
-    buggy: string;
-  };
 };
 
 export type TestResult = {

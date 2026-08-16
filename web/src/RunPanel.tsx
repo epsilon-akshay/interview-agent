@@ -1,4 +1,5 @@
 import type { RunResult } from "./runner/types";
+import type { KeyboardEvent } from "react";
 
 type Props = {
   running: boolean;
@@ -39,6 +40,14 @@ export function RunPanel({
         : "run-badge fail"
       : "run-badge";
 
+  function moveTab(event: KeyboardEvent<HTMLButtonElement>, current: "tests" | "output") {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
+    event.preventDefault();
+    const next = event.key === "Home" ? "tests" : event.key === "End" ? "output" : current === "tests" ? "output" : "tests";
+    onTabChange(next);
+    document.getElementById(`run-tab-${next}`)?.focus();
+  }
+
   return (
     <div className={`run-panel ${collapsed ? "collapsed" : ""}`}>
       <div className="run-panel-header">
@@ -46,11 +55,17 @@ export function RunPanel({
           {running ? <span className="run-spinner" aria-hidden="true" /> : <span aria-hidden="true">▶</span>}
           Run
         </button>
-        <div className="run-tabs">
+        <div className="run-tabs" role="tablist" aria-label="Code results">
           <button
+            id="run-tab-tests"
             className={activeTab === "tests" ? "run-tab active" : "run-tab"}
             onClick={() => onTabChange("tests")}
+            onKeyDown={(event) => moveTab(event, "tests")}
             type="button"
+            role="tab"
+            aria-selected={activeTab === "tests"}
+            aria-controls="run-panel-tests"
+            tabIndex={activeTab === "tests" ? 0 : -1}
           >
             Tests
             <span className={badgeClass}>
@@ -58,9 +73,15 @@ export function RunPanel({
             </span>
           </button>
           <button
+            id="run-tab-output"
             className={activeTab === "output" ? "run-tab active" : "run-tab"}
             onClick={() => onTabChange("output")}
+            onKeyDown={(event) => moveTab(event, "output")}
             type="button"
+            role="tab"
+            aria-selected={activeTab === "output"}
+            aria-controls="run-panel-output"
+            tabIndex={activeTab === "output" ? 0 : -1}
           >
             Output
           </button>
@@ -72,8 +93,8 @@ export function RunPanel({
 
       {!collapsed && (
         <div className="run-panel-body">
-          {activeTab === "tests" && <TestsTab running={running} result={result} totalTests={totalTests} />}
-          {activeTab === "output" && <OutputTab result={result} />}
+          <div id="run-panel-tests" role="tabpanel" aria-labelledby="run-tab-tests" hidden={activeTab !== "tests"}><TestsTab running={running} result={result} totalTests={totalTests} /></div>
+          <div id="run-panel-output" role="tabpanel" aria-labelledby="run-tab-output" hidden={activeTab !== "output"}><OutputTab result={result} /></div>
         </div>
       )}
     </div>

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { getModelConfig } from "./client";
 import type { RunResult } from "../runner/types";
 import type { InterviewPlan, Observation, QueuedQuestion, Signal, TranscriptTurn } from "./types";
+import { validatePlannerOutput } from "./lifecycle";
 
 const AnalysisSchema = z.object({
   observations: z.array(
@@ -12,7 +13,7 @@ const AnalysisSchema = z.object({
       finding: z.string(),
       confidence: z.number()
     })
-  ),
+  ).max(3),
   shouldAsk: z.boolean(),
   areaId: z.string(),
   question: z.string(),
@@ -34,6 +35,7 @@ FIRST — observations. Record what changed and what it reveals.
 
 SECOND — the next question.
 - Prefer the rubric area with the LEAST evidence and the HIGHEST weight.
+- Follow the current stage from the prepared interview pattern.
 - In the final quarter of the interview, prefer complexity and trade-offs.
 - The question must anchor to something concrete: their code, a test result, their diagram, or something they said. Put that anchor in basis.
 
@@ -49,7 +51,28 @@ Set shouldAsk to false when there is nothing worth asking. Silence is valid and 
 export type AnalysisResult = {
   observations: Observation[];
   question: QueuedQuestion | null;
+  validationErrors: string[];
 };
+
+export function validateAnalysisOutput(
+  output: z.infer<typeof AnalysisSchema> | undefined,
+  plan: InterviewPlan | null,
+  signal: Signal,
+  approvedPrompt = "",
+  askedQuestions: string[] = []
+): AnalysisResult {
+  const validated = validatePlannerOutput(output, (plan?.areas ?? []).map((area) => area.id), { approvedPrompt, askedQuestions });
+  const observations: Observation[] = validated.observations.map((entry) => ({
+      observer: entry.source,
+      areaId: entry.areaId,
+      finding: entry.finding.trim(),
+      confidence: entry.confidence,
+      codeRevision: signal.codeRevision,
+      whiteboardRevision: signal.whiteboardRevision,
+      at: Date.now()
+    }));
+  return { observations, question: validated.question, validationErrors: validated.validationErrors };
+}
 
 export async function analyse(input: {
   previousCode: string;
@@ -78,6 +101,13 @@ export async function analyse(input: {
         .join("\n")
     : `No plan available. Use this rubric directly:\n${input.rubric}`;
 
+  const stages = input.plan?.stages ?? [];
+  const totalSeconds = input.signal.elapsedSeconds + input.signal.remainingSeconds;
+  const stageIndex = stages.length === 0 || totalSeconds === 0
+    ? -1
+    : Math.min(stages.length - 1, Math.floor((input.signal.elapsedSeconds / totalSeconds) * stages.length));
+  const currentStage = stageIndex >= 0 ? stages[stageIndex] : null;
+
   const transcript = input.transcriptTail
     .map((turn) => `${turn.role === "candidate" ? "Candidate" : "Interviewer"}: ${turn.text}`)
     .join("\n");
@@ -94,6 +124,9 @@ ${input.question}
 
 Rubric areas and coverage:
 ${coverage}
+
+Current interview stage:
+${currentStage ? `${currentStage.name}: ${currentStage.goal}\nQuestion types: ${currentStage.questionTypes.join(", ")}` : "No prepared stage available."}
 
 Recent conversation:
 ${transcript || "(nothing spoken yet)"}
@@ -124,20 +157,5 @@ Triggering signal: ${input.signal.kind}`
   );
 
   const output = result.finalOutput as z.infer<typeof AnalysisSchema> | undefined;
-  if (!output) return { observations: [], question: null };
-
-  const observations: Observation[] = output.observations.map((entry) => ({
-    observer: entry.source,
-    areaId: entry.areaId,
-    finding: entry.finding,
-    confidence: entry.confidence,
-    at: Date.now()
-  }));
-
-  const question =
-    output.shouldAsk && output.question.trim()
-      ? { question: output.question.trim(), areaId: output.areaId, basis: output.basis }
-      : null;
-
-  return { observations, question };
+  return validateAnalysisOutput(output, input.plan, input.signal, input.question, input.askedQuestions);
 }

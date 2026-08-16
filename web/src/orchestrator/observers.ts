@@ -5,7 +5,7 @@ import type { Observation } from "./types";
  * Turns a code run into an observation. This is a FACT, not a judgement.
  * It makes no model call. Do not add one.
  */
-export function observeTestRun(lastRun: RunResult | null): Observation | null {
+export function observeTestRun(lastRun: RunResult | null, areaId = "correctness"): Observation | null {
   if (!lastRun) return null;
 
   let finding: string;
@@ -24,5 +24,5 @@ export function observeTestRun(lastRun: RunResult | null): Observation | null {
     if (failures) finding += ` Failures: ${failures}.`;
   }
 
-  return { observer: "tests", areaId: "correctness", finding, confidence: 1, at: Date.now() };
+  return { observer: "tests", areaId, finding, confidence: 1, codeRevision: lastRun.codeRevision, whiteboardRevision: 0, at: Date.now() };
 }

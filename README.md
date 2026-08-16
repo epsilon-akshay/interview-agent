@@ -1,100 +1,91 @@
 # Signal Interview
 
-Signal Interview is a local, automated coding-interview application built with Go, React, Monaco, tldraw, the OpenAI Agents SDK, Realtime speech-to-speech, and a separate Codex evaluation manager.
+Signal Interview is a local technical interview application. It uses Go, React, Monaco, tldraw, the OpenAI Agents SDK, and OpenAI Realtime.
 
-The interviewer presents a server-controlled problem, listens to the candidate, reviews changed code and whiteboard work, asks short rubric-driven questions, records evidence, and ends at a configurable time limit. Candidate code can run against browser-isolated checks. Afterward, an evaluation manager generates a structured report from the code, test results, whiteboard, and recorded evidence.
+The server owns each saved setup, prepared question, rubric, final artifact, and score. The browser owns the live editor, whiteboard, media, transcript, and interview timing.
 
-## Features
+## Runtime modes
 
-- Browser camera, microphone, video recording, Monaco code editor, and tldraw whiteboard
-- Browser-isolated code runner with visible checks and console output
-- Low-latency Realtime speech-to-speech interview
-- Tool-driven question, rubric, editor, and evidence access
-- Introduction, coding, and reflection agents with handoffs
-- Planning layer that decides what to ask, so the voice agent stays silent by default
-- Deterministic gates that never interrupt active typing
-- Precomputed questions, so a proactive probe lands in about four seconds
-- Candidate speech transcription feeding both live analysis and the final report
-- Zero-hint output guardrail that cuts leakage before the candidate hears it
-- Strict interviewer: one short question, no hints, praise, coaching, or answers
-- Fair challenge through assumptions, counterexamples, invariants, and edge cases
-- Configurable interview duration, five minutes by default
-- Graceful time-limit announcement and session shutdown
-- Final category scores, supporting evidence, gaps, risks, limitations, and recommendation
+The developer test bar appears only when `INTERVIEW_DEVELOPER_MODE=true`.
 
-## Architecture
+| Mode | AI use | Media | Result |
+|---|---|---|---|
+| AI checks | Preparation, text planner, and evaluation | None | Shows planner questions as text and creates a final report. |
+| AI voice | Preparation, planner, Realtime, and evaluation | Camera, microphone, and local recording | Runs the complete spoken interview and creates a final report. |
 
-```text
-Browser
-├── React setup, timer, report UI, and recording
-├── Monaco editor and browser code runner
-├── tldraw whiteboard
-├── Planning layer (Agents SDK)
-│   ├── Signal bus, no model calls
-│   ├── Interview planner, builds rubric coverage
-│   └── Analyst, observes and writes the next question
-└── Agents SDK RealtimeSession
-    ├── Introduction Agent
-    ├── Coding Interviewer
-    └── Reflection Agent
-          │ WebRTC audio + API tool calls + proxied model calls
-          ▼
-Go server
-├── Mints short-lived Realtime client secrets
-├── Proxies planning-layer model calls, holding the API key
-├── Serves the question bank
-├── Persists evidence and completion events
-├── Stores final private whiteboard artifacts
-├── Calls the Responses API for final structured evaluation
-├── Validates and stores versioned interview setup snapshots and uploads
-└── Serves the production frontend
+Monaco, its workers, tldraw, fonts, and icons ship in the production frontend.
+
+## Lifecycle
+
+```mermaid
+flowchart LR
+    A["Upload private inputs"] --> B["Save setup snapshot"]
+    B --> C["Prepare guide once"]
+    C --> D["Start selected runtime"]
+    D --> E["Save final artifacts"]
+    E --> F["Record completion"]
+    F --> G["Evaluate interview"]
 ```
 
-See [HLD.md](HLD.md) for the system design and [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for product behavior and acceptance criteria.
+Setup IDs are allocated before the first upload. A retry reuses the same ID and completed setup phases.
 
-## Agent flow
+AI voice acquires media, gets configuration and a short-lived Realtime token, then connects while candidate input stays muted. Bootstrap forces these tools in order:
 
-1. The Introduction Agent calls `get_interview_context`, `fetch_coding_question`, and `read_interview_rubric` in order.
-2. It briefly presents the problem and hands off to the Coding Interviewer.
-3. The interviewer uses `get_current_workspace`, `get_execution_results`, and `record_interview_evidence` to test rubric criteria.
-4. A one-second signal bus watches the editor, whiteboard, and test runs without calling any model. Gates block a question until typing stops, 45 seconds have passed, and the agent is idle.
-5. An analyst call records what changed and writes the next question. It runs ahead of the gate, so the question is usually ready before it is needed. The voice agent receives the finished text and speaks it verbatim.
-6. The Reflection Agent can test complexity, invariants, edge cases, and tradeoffs.
-7. At the time limit, the browser mutes input, records completion, asks the active agent to announce that time is up, and closes after final audio.
-8. The Evaluation Manager reads the final question, rubric, code, test evidence, whiteboard summary, whiteboard PNG, transcript, and recorded evidence. It returns a schema-validated report.
+1. `get_interview_context`
+2. `fetch_interview_question`
+3. `read_interview_rubric`
+
+Each tool-choice update waits for a matching `session.updated` acknowledgement. The Introduction Agent remains active until the approved primary question finishes playback. The app then switches to the Interview Conductor with automatic tool choice, unmutes candidate input, and starts the 45-second planner clock.
+
+Manual and timer endings share one retry-safe path. The browser captures the latest code and a revision-stable whiteboard. It stores those artifacts before completion. Every interview evaluates only after completion succeeds. Ending during voice bootstrap closes without waiting for a time-up audio fallback.
 
 ## Run locally
 
-Requirements: Go 1.19+, Node.js 20+, a modern browser, and an OpenAI Platform API key with access to the configured models.
+Requirements:
 
-Create `.env`:
+- Go 1.19 or newer
+- Node.js 22.12.0 or newer
+- npm 9 or newer
+- A modern browser
+- An OpenAI Platform API key
+
+Copy `.env.example` to `.env` and add a Platform API key.
 
 ```dotenv
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_REALTIME_MODEL=gpt-realtime-2.1-mini
-OPENAI_EVALUATION_MODEL=gpt-5.2-codex
-# Planning layer. Leave blank to fall back to OPENAI_EVALUATION_MODEL.
-# Set OPENAI_OBSERVER_MODEL to a fast general model; it runs during the interview.
+OPENAI_EVALUATION_MODEL=gpt-5.6-terra
+# Blank values fall back to OPENAI_EVALUATION_MODEL.
 OPENAI_OBSERVER_MODEL=
 OPENAI_ORCHESTRATOR_MODEL=
-# Required for a production deployment. The build reads this from the root .env.
+INTERVIEW_DEVELOPER_MODE=false
 VITE_TLDRAW_LICENSE_KEY=your_tldraw_license_key_here
+APP_ADDR=127.0.0.1:8080
+INTERVIEW_ALLOW_UNSAFE_NETWORK_BIND=false
 ```
 
-Then run:
+Install and run:
 
 ```bash
 make install
 make run
 ```
 
-Open <http://localhost:8080> and allow camera and microphone access. The recording remains in browser memory; save it before refreshing.
+Open <http://127.0.0.1:8080>. Voice mode asks for camera and microphone access. A recording stays in browser memory until it is downloaded or discarded.
 
-Do not use a ChatGPT Plus subscription token or Codex CLI login token in `.env`. API usage requires a Platform API key and is billed separately.
+`APP_ADDR` defaults to `127.0.0.1:8080`. The `-addr` command flag overrides it. A key-bearing server refuses a non-loopback bind unless `INTERVIEW_ALLOW_UNSAFE_NETWORK_BIND=true`. This opt-in is unsafe because the app has no user authentication.
+
+Browser mutation requests must have the same origin as the server. Paid endpoints also limit concurrent requests and request starts. These controls reduce local misuse. They do not make the app safe for a public network.
+
+Use an OpenAI Platform API key. ChatGPT subscriptions and Codex CLI login tokens do not fund API calls.
+
+## tldraw license
+
+The local HTTP app does not need a tldraw production license key. A hosted HTTPS deployment needs a valid `VITE_TLDRAW_LICENSE_KEY`. The value is part of the browser build, so it is not a secret.
 
 ## Development
 
-Run the backend and Vite frontend separately:
+Run the server and Vite in separate terminals:
 
 ```bash
 go run ./cmd/server -dev-dir web
@@ -105,31 +96,93 @@ cd web
 npm run dev
 ```
 
-Open <http://localhost:5173>. Vite proxies `/api` requests to Go on port 8080.
+Open <http://127.0.0.1:5173>. Vite sends `/api` requests to `127.0.0.1:8080`.
+
+Agents SDK tracing is disabled. The application does not export browser agent traces.
+
+## Checks and release build
+
+```bash
+make check
+make doctor
+make build
+make check-web-freshness
+make release-check
+```
+
+- `make check` runs frontend unit tests, frontend type checking, and Go tests.
+- `make doctor` checks Node.js 22.12.0+, local tools, installed dependencies, bind safety, runtime permissions, hidden key presence, model names, and embedded assets. It makes no provider call and never prints the key.
+- `make doctor-test` verifies the Node.js version gate with fixed version values. It does not use the machine Node version.
+- `make build` is the canonical production build. It writes the frontend to `cmd/server/webdist` and the server binary to `bin/interviewer`.
+- `make check-web-freshness` compares embedded files with a fresh isolated production build. It fails when frontend source changed without a canonical rebuild.
+- `make scan-web-assets` rejects jsDelivr, unpkg, and cdnjs paths in emitted assets. The tldraw package retains one unused default CDN literal; `WhiteboardPanel` overrides it with `getAssetUrlsByImport()` local files, and browser coverage blocks every non-loopback request while rendering the editor.
+- `make release-check` adds browser tests, Go race tests, Go vet, a canonical build, and embedded-file freshness checks.
+
+Build cleanup removes only generated binaries and caches:
+
+```bash
+make clean-build
+```
+
+Runtime cleanup permanently deletes private interview data. It is separate and requires an exact confirmation:
+
+```bash
+CONFIRM_PURGE_RUNTIME=DELETE_RUNTIME make purge-runtime
+```
 
 ## API
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Server health |
-| `POST` | `/api/realtime/token` | Mint an ephemeral Realtime client secret |
-| `GET` | `/api/interview/question` | Load the coding problem, starter code, and tests |
-| `POST` | `/api/interview/uploads` | Store a private setup input file (10 MB maximum) |
-| `POST` | `/api/interview/setups` | Validate and save an InterviewSetup v1 snapshot |
-| `GET` | `/api/interview/setups/{id}` | Read a saved InterviewSetup v1 snapshot |
-| `POST` | `/api/interview/evidence` | Append a rubric evidence event |
+| `GET` | `/api/health` | Check server health |
+| `GET` | `/api/config` | Read planner model names and developer-mode state |
+| `POST` | `/api/interview/uploads` | Store a private setup file |
+| `POST` | `/api/interview/setups` | Validate and save a setup snapshot |
+| `GET` | `/api/interview/setups/{id}` | Read a saved setup snapshot |
+| `POST` | `/api/interview/setups/{id}/prepare` | Create or read a prepared guide |
+| `POST` | `/api/realtime/token` | Mint a short-lived Realtime client secret |
+| `POST` | `/api/openai/v1/responses` | Proxy allowed planner Responses calls |
+| `POST` | `/api/interview/evidence` | Store an idempotent evidence event |
+| `POST` | `/api/interview/artifacts` | Store immutable final code and whiteboard artifacts without AI |
 | `POST` | `/api/interview/complete` | Record the terminal event |
-| `POST` | `/api/interview/evaluate` | Generate the final structured report |
-| `GET` | `/api/config` | Return planning-layer model names |
-| `POST` | `/api/openai/v1/*` | Proxy planning-layer model calls, injecting the API key |
+| `POST` | `/api/interview/evaluate` | Create or return the final server-owned report |
 
-Runtime events are written to `runtime/*.jsonl`. Final whiteboard scenes and PNGs are written to `runtime/whiteboards/`. Treat both as private interview data.
+There is no local chat endpoint, local question endpoint, or `/api/realtime/session` route. Unknown API paths return `404`.
 
-Interview setup snapshots and uploads are written under `runtime/setups/{setupId}/`. See [Interview Setup Backend v1](docs/plans/05-interview-setup-backend.md) for the versioned contract and setup-ID lifecycle.
+A prepared guide is the only candidate-facing question source. Verified solutions and buggy fixtures stay server-private.
 
-## Important limitations
+## Persistence and evaluation
 
-- Code runs in a browser worker. This is suitable for the demo, not for untrusted production execution.
-- The workspace monitor reads Monaco text and tldraw content. It never sends camera frames or unrelated screen content.
-- Prompt rules reduce hints and verbosity but production systems should add automated conversation-policy evaluations.
-- JSONL storage is suitable for a local demo, not multi-instance production deployment.
+Private files live under `runtime/`:
+
+- setup snapshots, uploads, and prepared guides: `runtime/setups/{setupId}/`
+- evidence: `runtime/evidence.jsonl`
+- final artifacts: `runtime/artifacts/{sessionId}/`
+- completions: `runtime/completions.jsonl`
+- evaluations: `runtime/evaluations.jsonl`
+
+Every evidence request includes `sessionId`, a stable 32-character lowercase-hex `eventId`, `category`, `observation`, `confidence`, `codeRevision`, and `whiteboardRevision`. A retry reuses the exact payload.
+
+Final artifacts are immutable. The first payload returns `201`. An identical retry returns `200`. A different payload returns `409`.
+
+Evaluation accepts only:
+
+```json
+{
+  "sessionId": "0123456789abcdef0123456789abcdef",
+  "transcript": []
+}
+```
+
+The server loads the saved setup, prepared rubric, evidence, completion, and immutable final artifacts. The model returns criterion judgments only. The server restores names and weights, validates every prepared criterion, and computes the weighted score. An identical evaluation retry returns the stored report. A retry with a different transcript returns `409`.
+
+Preparation is fixed per setup ID. The first successful request returns the saved guide on later retries.
+
+## Limits
+
+- The browser code worker is suitable for a local demo. It is not a production sandbox for untrusted code.
+- JSONL and local files support one local server. They do not support a multi-instance deployment.
+- The app does not provide authentication, remote access control, retention policy, or recording consent management.
+- Runtime files contain private interview data. Do not commit or share them.
+
+See [HLD.md](HLD.md), [PRODUCT_SPEC.md](PRODUCT_SPEC.md), and [docs/plans](docs/plans) for more detail.

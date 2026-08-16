@@ -8,6 +8,7 @@ export type WhiteboardSnapshot = {
 export type WhiteboardPanelHandle = {
   exportPng: () => Promise<string | null>;
   exportSceneJson: () => Promise<string | null>;
+  getSnapshot: () => WhiteboardSnapshot;
   reset: () => void;
 };
 

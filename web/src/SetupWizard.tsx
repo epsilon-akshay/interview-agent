@@ -1,13 +1,12 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type {
   ChannelOption,
   InterviewSetupDraft,
   InterviewType,
   RubricCriterionDraft,
-  ToolOption,
   WorkspaceOption
 } from "./setup/types";
-import { setupStepError } from "./setup/types";
+import { compatibleInterviewDefaults, compatibleQuestionTypes, setupStepError } from "./setup/types";
 
 type Props = {
   value: InterviewSetupDraft;
@@ -137,9 +136,13 @@ function RubricRow({
 export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
   const [step, setStep] = useState(0);
   const [localError, setLocalError] = useState("");
+  const explicitFieldsRef = useRef(new Set<"codingLanguage" | "questionTypes" | "workspaces">());
   const rubricTotal = value.rubricCriteria.reduce((sum, criterion) => sum + criterion.weight, 0);
 
   function update(patch: Partial<InterviewSetupDraft>) {
+    (Object.keys(patch) as (keyof InterviewSetupDraft)[]).forEach((key) => {
+      if (key === "codingLanguage" || key === "questionTypes" || key === "workspaces") explicitFieldsRef.current.add(key);
+    });
     onChange({ ...value, ...patch });
     setLocalError("");
   }
@@ -186,7 +189,7 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
           <>
             <div className="setup-step-heading">
               <h2>Who is this interview for?</h2>
-              <p>Set the candidate and the role being assessed.</p>
+              <p>Add the candidate. Leave role details empty if AI should derive them from the supplied context.</p>
             </div>
             <div className="setup-row">
               <label>
@@ -201,6 +204,7 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
             <label>
               Seniority level
               <select value={value.roleLevel} onChange={(event) => update({ roleLevel: event.target.value })}>
+                <option value="">Let AI choose</option>
                 <option>Entry-level</option>
                 <option>Mid-level</option>
                 <option>Senior</option>
@@ -215,12 +219,24 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
           <>
             <div className="setup-step-heading">
               <h2>Shape the interview</h2>
-              <p>Set the format, time, language, and question mix.</p>
+              <p>Set fixed constraints. AI fills an empty language or question mix.</p>
             </div>
             <div className="setup-row">
               <label>
                 Interview type
-                <select value={value.interviewType} onChange={(event) => update({ interviewType: event.target.value as InterviewType })}>
+                <select value={value.interviewType} onChange={(event) => {
+                  const interviewType = event.target.value as InterviewType;
+                  const defaults = compatibleInterviewDefaults(interviewType);
+                  const explicit = explicitFieldsRef.current;
+                  const compatibleExplicitQuestions = compatibleQuestionTypes(interviewType, value.questionTypes);
+                  onChange({
+                    ...value,
+                    interviewType,
+                    codingLanguage: explicit.has("codingLanguage") ? (interviewType === "behavioral" || interviewType === "system_design" ? "" : value.codingLanguage) : defaults.codingLanguage,
+                    questionTypes: explicit.has("questionTypes") && compatibleExplicitQuestions.length > 0 ? compatibleExplicitQuestions : defaults.questionTypes,
+                    workspaces: explicit.has("workspaces") ? value.workspaces.filter((workspace) => interviewType === "coding" || interviewType === "mixed" || workspace !== "code_editor") : defaults.workspaces
+                  });
+                }}>
                   {INTERVIEW_TYPES.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                 </select>
               </label>
@@ -235,15 +251,10 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
                 />
               </label>
             </div>
-            <label>
+            {(value.interviewType === "coding" || value.interviewType === "mixed") && <label>
               Coding language
-              <input
-                value={value.codingLanguage}
-                onChange={(event) => update({ codingLanguage: event.target.value })}
-                placeholder="TypeScript"
-                disabled={value.interviewType === "behavioral"}
-              />
-            </label>
+              <input value="TypeScript" readOnly aria-readonly="true" />
+            </label>}
             <fieldset>
               <legend>Question types</legend>
               <div className="setup-choice-grid compact">
@@ -264,7 +275,7 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
           <>
             <div className="setup-step-heading">
               <h2>Add relevant context</h2>
-              <p>Provide an interview brief and reviewed candidate information.</p>
+              <p>Add available context. AI writes a missing brief from the role and interview type.</p>
             </div>
             <label>
               Interview brief
@@ -317,9 +328,11 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
             <div className="setup-step-heading rubric-heading">
               <div>
                 <h2>Define the scoring rubric</h2>
-                <p>Every criterion needs a weight and observable evidence.</p>
+                <p>Add weighted criteria. Leave the list empty if AI should create the rubric.</p>
               </div>
-              <span className={rubricTotal === 100 ? "valid" : "invalid"}>{rubricTotal}% total</span>
+              <span className={value.rubricCriteria.length === 0 ? "ai-generated" : rubricTotal === 100 ? "valid" : "invalid"}>
+                {value.rubricCriteria.length === 0 ? "AI generated" : `${rubricTotal}% total`}
+              </span>
             </div>
             <div className="rubric-list">
               {value.rubricCriteria.map((criterion, index) => (
@@ -327,11 +340,12 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
                   key={index}
                   criterion={criterion}
                   index={index}
-                  canRemove={value.rubricCriteria.length > 1}
+                  canRemove
                   onChange={(next) => updateCriterion(index, next)}
                   onRemove={() => update({ rubricCriteria: value.rubricCriteria.filter((_, currentIndex) => currentIndex !== index) })}
                 />
               ))}
+              {value.rubricCriteria.length === 0 ? <p className="rubric-empty">AI will create weighted criteria with observable evidence.</p> : null}
             </div>
             <button type="button" className="setup-add-button" onClick={addCriterion}>Add criterion</button>
             <label>
@@ -351,33 +365,22 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
           <>
             <div className="setup-step-heading">
               <h2>Choose access and review</h2>
-              <p>Set the candidate's workspaces, tools, and interview channel.</p>
+              <p>Set the candidate's workspaces and interview channel.</p>
             </div>
             <fieldset>
               <legend>Candidate workspaces</legend>
               <div className="setup-choice-grid">
-                <Choice
+                {(value.interviewType === "coding" || value.interviewType === "mixed") && <Choice
                   checked={value.workspaces.includes("code_editor")}
                   label="Code editor"
                   description="Write and run code in the browser."
-                  onChange={() => update({ workspaces: toggleValue<WorkspaceOption>(value.workspaces, "code_editor") })}
-                />
+                  onChange={() => update({ workspaces: toggleValue<WorkspaceOption>(value.workspaces, "code_editor"), codingLanguage: "TypeScript" })}
+                />}
                 <Choice
                   checked={value.workspaces.includes("whiteboard")}
                   label="Whiteboard"
                   description="Explain systems with shapes and labels."
                   onChange={() => update({ workspaces: toggleValue<WorkspaceOption>(value.workspaces, "whiteboard") })}
-                />
-              </div>
-            </fieldset>
-            <fieldset>
-              <legend>Candidate tools</legend>
-              <div className="setup-choice-grid">
-                <Choice
-                  checked={value.tools.includes("ai_chat")}
-                  label="AI chat"
-                  description="Use AI help while implementing code in the editor."
-                  onChange={() => update({ tools: toggleValue<ToolOption>(value.tools, "ai_chat") })}
                 />
               </div>
             </fieldset>
@@ -394,9 +397,9 @@ export function SetupWizard({ value, onChange, onStart, busy, error }: Props) {
             </fieldset>
             <dl className="setup-review">
               <div><dt>Candidate</dt><dd>{value.candidateName}</dd></div>
-              <div><dt>Role</dt><dd>{value.roleLevel} {value.roleTitle}</dd></div>
+              <div><dt>Role</dt><dd>{`${value.roleLevel} ${value.roleTitle}`.trim() || "AI generated"}</dd></div>
               <div><dt>Interview</dt><dd>{value.interviewType.replaceAll("_", " ")} · {value.durationMinutes} minutes</dd></div>
-              <div><dt>Rubric</dt><dd>{value.rubricCriteria.length} criteria · {rubricTotal}% total</dd></div>
+              <div><dt>Rubric</dt><dd>{value.rubricCriteria.length === 0 ? "AI generated" : `${value.rubricCriteria.length} criteria · ${rubricTotal}% total`}</dd></div>
             </dl>
             <p className="setup-policy-note">Candidate information can tailor job-related questions. It cannot change rubric weights or count as interview evidence.</p>
           </>

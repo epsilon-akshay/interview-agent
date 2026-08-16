@@ -1,11 +1,13 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import { serializeTldrawJson, Tldraw, type Editor, type TLComponents } from "tldraw";
+import { getAssetUrlsByImport } from "@tldraw/assets/imports.vite";
 import "tldraw/tldraw.css";
 import { summarizeWhiteboard, type WhiteboardShape } from "./whiteboard/scene";
 import type { WhiteboardPanelHandle, WhiteboardSnapshot } from "./whiteboard/types";
 
 type WhiteboardPanelProps = {
   onSnapshotChange: (snapshot: WhiteboardSnapshot) => void;
+  readOnly?: boolean;
 };
 
 const WHITEBOARD_COMPONENTS: TLComponents = {
@@ -15,6 +17,9 @@ const WHITEBOARD_COMPONENTS: TLComponents = {
 const WHITEBOARD_OPTIONS = {
   maxPages: 1
 };
+
+// Vite turns these official tldraw asset imports into same-origin build files.
+const LOCAL_TLDRAW_ASSET_URLS = getAssetUrlsByImport();
 
 function describeShapes(editor: Editor): WhiteboardShape[] {
   return editor.getCurrentPageShapesSorted().map((shape) => {
@@ -40,7 +45,7 @@ function describeShapes(editor: Editor): WhiteboardShape[] {
 }
 
 export const WhiteboardPanel = forwardRef<WhiteboardPanelHandle, WhiteboardPanelProps>(
-  function WhiteboardPanel({ onSnapshotChange }, ref) {
+  function WhiteboardPanel({ onSnapshotChange, readOnly = false }, ref) {
     const editorRef = useRef<Editor | null>(null);
     const stopListeningRef = useRef<(() => void) | null>(null);
     const revisionRef = useRef(0);
@@ -51,9 +56,14 @@ export const WhiteboardPanel = forwardRef<WhiteboardPanelHandle, WhiteboardPanel
       if (notifyTimerRef.current !== null) window.clearTimeout(notifyTimerRef.current);
     }, []);
 
+    useEffect(() => {
+      editorRef.current?.updateInstanceState({ isReadonly: readOnly });
+    }, [readOnly]);
+
     function handleMount(editor: Editor) {
       stopListeningRef.current?.();
       editorRef.current = editor;
+      editor.updateInstanceState({ isReadonly: readOnly });
       stopListeningRef.current = editor.store.listen(() => {
         revisionRef.current += 1;
         const changedAt = Date.now();
@@ -93,6 +103,16 @@ export const WhiteboardPanel = forwardRef<WhiteboardPanelHandle, WhiteboardPanel
         if (!editor || editor.getCurrentPageShapes().length === 0) return null;
         return serializeTldrawJson(editor);
       },
+      getSnapshot() {
+        const editor = editorRef.current;
+        const shapes = editor ? describeShapes(editor) : [];
+        return {
+          revision: revisionRef.current,
+          changedAt: Date.now(),
+          elementCount: shapes.length,
+          summary: summarizeWhiteboard(shapes)
+        };
+      },
       reset() {
         const editor = editorRef.current;
         if (notifyTimerRef.current !== null) window.clearTimeout(notifyTimerRef.current);
@@ -108,6 +128,7 @@ export const WhiteboardPanel = forwardRef<WhiteboardPanelHandle, WhiteboardPanel
           components={WHITEBOARD_COMPONENTS}
           colorScheme="light"
           licenseKey={import.meta.env.VITE_TLDRAW_LICENSE_KEY}
+          assetUrls={LOCAL_TLDRAW_ASSET_URLS}
           onMount={handleMount}
           options={WHITEBOARD_OPTIONS}
         />

@@ -8,6 +8,11 @@ export type RubricArea = {
 
 export type InterviewPlan = {
   areas: RubricArea[];
+  stages: {
+    name: string;
+    goal: string;
+    questionTypes: string[];
+  }[];
 };
 
 export type SignalKind = "code_changed" | "whiteboard_changed" | "tests_run" | "silence";
@@ -25,6 +30,8 @@ export type Observation = {
   areaId: string;
   finding: string;
   confidence: number;
+  codeRevision: number;
+  whiteboardRevision: number;
   at: number;
 };
 

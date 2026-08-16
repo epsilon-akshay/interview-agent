@@ -1,21 +1,37 @@
 import type { RealtimeOutputGuardrail } from "@openai/agents/realtime";
+import { outputSafetyViolation } from "./outputSafety";
 
-const BANNED_PATTERNS: { label: string; pattern: RegExp }[] = [
-  { label: "director instruction leak", pattern: /INTERVIEW DIRECTOR|Context for your own understanding/i },
-  { label: "algorithm suggestion", pattern: /\b(use|try|consider|maybe)\b[^.?!]{0,40}\b(hash ?map|hash ?set|dictionary|two pointers?|sliding window|binary search|memoi[sz]|dynamic programming|frequency (map|counter|array))\b/i },
-  { label: "correctness verdict", pattern: /\b(that('s| is) (correct|right|wrong)|you got it|exactly right|that works|incorrect)\b/i },
-  { label: "praise", pattern: /\b(great|good) (job|work|answer|approach)\b|\b(nice|excellent|perfect|well done|awesome)\b/i },
-  { label: "code leak", pattern: /(for\s*\(|while\s*\(|function\s+\w+\s*\(|=>\s*\{|\.set\(|\.get\()/ }
-];
+export function stripApprovedPrompt(output: string, approvedPrompt: string, allowBootstrapOverlap: boolean) {
+  if (!allowBootstrapOverlap || !approvedPrompt) return output;
+  const fullIndex = output.indexOf(approvedPrompt);
+  if (fullIndex >= 0) return `${output.slice(0, fullIndex)}${output.slice(fullIndex + approvedPrompt.length)}`;
+  const maximum = Math.min(output.length, approvedPrompt.length);
+  for (let length = maximum; length >= 4; length -= 1) {
+    if (output.endsWith(approvedPrompt.slice(0, length))) return output.slice(0, -length);
+  }
+  return output;
+}
 
-export const zeroHintGuardrail: RealtimeOutputGuardrail = {
+export function zeroHintViolation(output: string, approvedPrompt = "", allowBootstrapOverlap = false) {
+  const outputToCheck = stripApprovedPrompt(output, approvedPrompt.trim(), allowBootstrapOverlap);
+  return outputSafetyViolation(outputToCheck, { approvedPrompt });
+}
+
+export function zeroHintGuardrailWithApprovedQuestion(
+  question: string,
+  allowBootstrapOverlap: () => boolean = () => false
+): RealtimeOutputGuardrail {
+  const normalizedQuestion = question.trim();
+  return {
   name: "zero_hint",
   async execute({ agentOutput }) {
-    for (const entry of BANNED_PATTERNS) {
-      if (entry.pattern.test(agentOutput)) {
-        return { tripwireTriggered: true, outputInfo: { reason: entry.label } };
-      }
-    }
+    // The server-approved primary question is allowed during bootstrap even if it
+    // contains a function signature. All invented code remains guarded.
+    const violation = zeroHintViolation(agentOutput, normalizedQuestion, allowBootstrapOverlap());
+    if (violation) return { tripwireTriggered: true, outputInfo: { reason: violation } };
     return { tripwireTriggered: false, outputInfo: {} };
   }
-};
+  };
+}
+
+export const zeroHintGuardrail = zeroHintGuardrailWithApprovedQuestion("");

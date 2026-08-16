@@ -3,15 +3,23 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=9.0.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:unit": "tsc -p tsconfig.lifecycle.json && esbuild tests/test-modules.ts --bundle --platform=node --format=esm --packages=external --outfile=tests/.compiled/test-modules.mjs && node --test tests/lifecycle.test.mjs",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
     "@openai/agents": "^0.15.0",
+    "@tldraw/assets": "^5.3.1",
     "@vitejs/plugin-react": "4.3.4",
+    "monaco-editor": "^0.56.0",
     "openai": "^7.4.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
@@ -21,6 +29,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/react": "18.3.18",
     "@types/react-dom": "18.3.5"
   }

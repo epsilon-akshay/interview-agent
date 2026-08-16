@@ -3,8 +3,26 @@ import { RealtimeAgent, RealtimeSession, OpenAIRealtimeWebRTC, tool } from "@ope
 import { z } from "zod";
 import type { RunResult } from "./runner/types";
 import type { ActivityRow, InterviewPlan, Observation, TranscriptTurn } from "./orchestrator/types";
-import { startSignalBus } from "./orchestrator/signalBus";
-import { zeroHintGuardrail } from "./orchestrator/guardrails";
+import { startSignalBus, type SignalBus } from "./orchestrator/signalBus";
+import { zeroHintGuardrailWithApprovedQuestion } from "./orchestrator/guardrails";
+import type { PreparedInterview } from "./setup/prepared";
+import { createQuestionDeliveryTracker, realtimeResponseText, type QuestionDeliveryTracker } from "./orchestrator/questionDelivery";
+import {
+  createRealtimeBootstrapAdapter,
+  createRealtimeBootstrapLifecycle,
+  createRealtimeTranscriptStore,
+  realtimeGuardrailIdentity,
+  realtimePlaybackStoppedResponse,
+  realtimeToolChoiceOverride,
+  type RealtimeBootstrapLifecycle,
+  type RealtimeTranscriptStore
+} from "./orchestrator/realtimeBootstrap";
+import {
+  buildEvidenceRequest,
+  postCompletionRequest,
+  serializeEvidenceRequest,
+  type CompletionRequest
+} from "./runtimeContracts";
 
 export type AgentStatus = "idle" | "connecting" | "listening" | "thinking" | "speaking" | "ending" | "error";
 
@@ -13,6 +31,7 @@ export type InterviewAgentConfig = {
   candidate: string;
   role: string;
   durationSeconds: number;
+  guide: PreparedInterview;
   media: MediaStream;
   voiceEnabled: boolean;
   getRubric: () => string;
@@ -30,8 +49,11 @@ export type InterviewAgentConfig = {
   getElapsedSeconds: () => number;
   onActivity: (row: ActivityRow) => void;
   onObservation: (observation: Observation) => void;
+  onEvidenceError: (message: string, retry: () => Promise<void>) => void;
   onTranscriptTurn?: (turn: TranscriptTurn) => void;
   onQuestion: (question: string) => void;
+  onQuestionDelivered: (question: string, at: number) => void;
+  onCompletionError: (message: string) => void;
   onFinished: (reason: string) => void;
 };
 
@@ -56,12 +78,16 @@ export function useInterviewAgent() {
   const endFallbackRef = useRef<number | null>(null);
   const observationsRef = useRef<Observation[]>([]);
   const askedQuestionsRef = useRef<string[]>([]);
-  const stopSignalBusRef = useRef<(() => void) | null>(null);
-  const transcriptRef = useRef<TranscriptTurn[]>([]);
-  const seenTranscriptItemsRef = useRef<Set<string>>(new Set());
-  const whiteboardImageCacheRef = useRef<string | null>(null);
+  const signalBusRef = useRef<SignalBus | null>(null);
+  const transcriptStoreRef = useRef<RealtimeTranscriptStore | null>(null);
+  const whiteboardImageCacheRef = useRef<{ revision: number; image: string } | null>(null);
   const imageCacheTimerRef = useRef<number | null>(null);
   const statusRef = useRef<AgentStatus>("idle");
+  const bootstrapRef = useRef<RealtimeBootstrapLifecycle<RealtimeAgent> | null>(null);
+  const deliveryTrackerRef = useRef<QuestionDeliveryTracker | null>(null);
+  const tokenCacheRef = useRef<{ sessionId: string; value: string; model: string } | null>(null);
+  const closedInterviewRef = useRef(false);
+  const requestedMutedRef = useRef(false);
 
   const updateStatus = useCallback((next: AgentStatus) => {
     statusRef.current = next;
@@ -73,51 +99,95 @@ export function useInterviewAgent() {
   }, []);
 
   const closeNow = useCallback((reason: string) => {
+    if (closedInterviewRef.current) return;
+    closedInterviewRef.current = true;
     if (endFallbackRef.current !== null) window.clearTimeout(endFallbackRef.current);
     endFallbackRef.current = null;
-    stopSignalBusRef.current?.();
-    stopSignalBusRef.current = null;
+    signalBusRef.current?.stop();
+    signalBusRef.current = null;
     if (imageCacheTimerRef.current !== null) window.clearInterval(imageCacheTimerRef.current);
     imageCacheTimerRef.current = null;
-    sessionRef.current?.close();
+    const bootstrap = bootstrapRef.current;
+    bootstrap?.stop();
+    if (bootstrap) bootstrap.close();
+    else sessionRef.current?.close();
+    bootstrapRef.current = null;
     sessionRef.current = null;
+    tokenCacheRef.current = null;
+    deliveryTrackerRef.current?.reset();
+    deliveryTrackerRef.current = null;
     updateStatus("idle");
-    configRef.current?.onFinished(reason);
+    const config = configRef.current;
+    configRef.current = null;
+    config?.onFinished(reason);
   }, [updateStatus]);
 
   const connect = useCallback(async (config: InterviewAgentConfig) => {
-    sessionRef.current?.close();
+    const previousBootstrap = bootstrapRef.current;
+    previousBootstrap?.stop();
+    if (previousBootstrap) previousBootstrap.close();
+    else sessionRef.current?.close();
+    bootstrapRef.current = null;
     configRef.current = config;
+    closedInterviewRef.current = false;
     endingRef.current = false;
+    requestedMutedRef.current = false;
     closingAudioRef.current = false;
+    setActiveAgent("Introduction Agent");
     updateStatus("connecting");
     setError("");
     setToolEvents([]);
+    transcriptStoreRef.current = createRealtimeTranscriptStore(config.onTranscriptTurn);
+    config.media.getAudioTracks().forEach((track) => { track.enabled = false; });
+    const deliveryTracker = createQuestionDeliveryTracker((question, at) => {
+      void bootstrapRef.current?.confirmPrimaryDelivery(question, at);
+    });
+    deliveryTracker.queue(config.guide.question.prompt);
+    deliveryTrackerRef.current = deliveryTracker;
 
     const getInterviewContext = tool({
       name: "get_interview_context",
-      description: "Mandatory first tool. Retrieve candidate identity, role and time limit before introducing the interview.",
+      description: "Mandatory first tool. Retrieve the prepared interview guide before introducing the interview.",
       parameters: z.object({}),
       async execute() {
-        return {
+        const bootstrap = bootstrapRef.current;
+        if (!bootstrap) throw new Error("The introduction sequence is unavailable.");
+        return bootstrap.runTool("get_interview_context", () => ({
           candidate: config.candidate,
-          role: config.role,
+          role: config.guide.role,
+          roleMission: config.guide.roleMission,
+          interviewType: config.guide.interview.type,
+          codingLanguage: config.guide.interview.codingLanguage,
           durationMinutes: Math.round(config.durationSeconds / 60),
-          instruction: "Introduce yourself briefly and explain that this is a timed coding interview."
-        };
+          brief: config.guide.brief,
+          questionTypes: config.guide.interview.questionTypes,
+          pattern: config.guide.pattern,
+          candidateFocus: config.guide.candidateFocus,
+          candidateAccess: {
+            workspaces: config.guide.interview.workspaces,
+            tools: config.guide.interview.tools,
+            channels: config.guide.interview.channels
+          },
+          evidenceRule: "Candidate context can tailor questions. Treat only evidence observed during this interview as scoring evidence."
+        }));
       }
     });
 
-    const fetchCodingQuestion = tool({
-      name: "fetch_coding_question",
-      description: "Mandatory second tool. Fetch the coding question from the server-side question bank.",
+    const fetchInterviewQuestion = tool({
+      name: "fetch_interview_question",
+      description: "Mandatory second tool. Read the primary question from the prepared interview guide.",
       parameters: z.object({}),
       async execute() {
-        const response = await fetch("/api/interview/question");
-        if (!response.ok) throw new Error("Question bank is unavailable.");
-        const data = await response.json() as { id: string; prompt: string };
-        config.onQuestion(data.prompt);
-        return { id: data.id, prompt: data.prompt };
+        const bootstrap = bootstrapRef.current;
+        if (!bootstrap) throw new Error("The introduction sequence is unavailable.");
+        return bootstrap.runTool("fetch_interview_question", () => {
+          config.onQuestion(config.guide.question.prompt);
+          return {
+            id: config.guide.question.id,
+            prompt: config.guide.question.prompt,
+            language: config.guide.question.language
+          };
+        });
       }
     });
 
@@ -126,7 +196,17 @@ export function useInterviewAgent() {
       description: "Mandatory third tool. Read the recruiter-provided rubric textbox before asking substantive questions.",
       parameters: z.object({ reason: z.string().describe("Why the rubric is needed at this point") }),
       async execute({ reason }) {
-        return { reason, rubric: config.getRubric() };
+        const bootstrap = bootstrapRef.current;
+        if (!bootstrap) throw new Error("The introduction sequence is unavailable.");
+        return bootstrap.runTool("read_interview_rubric", () => ({
+          reason,
+          criteria: config.guide.rubric.criteria.map((criterion) => ({
+            id: criterion.id,
+            name: criterion.name,
+            weight: criterion.weight,
+            expectedEvidence: criterion.expectedEvidence
+          }))
+        }));
       }
     });
 
@@ -135,7 +215,7 @@ export function useInterviewAgent() {
       description: "Inspect the exact current Monaco editor contents before discussing or judging the implementation.",
       parameters: z.object({ reason: z.string() }),
       async execute({ reason }) {
-        return { reason, language: "typescript", revision: config.getCodeRevision(), code: config.getCode() };
+        return { reason, language: config.guide.question.language, revision: config.getCodeRevision(), code: config.getCode() };
       }
     });
 
@@ -146,15 +226,15 @@ export function useInterviewAgent() {
       async execute({ reason }) {
         return {
           reason,
-          code: {
-            language: "typescript",
+          ...(config.guide.interview.workspaces.includes("code_editor") ? { code: {
+            language: config.guide.question.language,
             revision: config.getCodeRevision(),
             contents: config.getCode()
-          },
-          whiteboard: {
+          } } : {}),
+          ...(config.guide.interview.workspaces.includes("whiteboard") ? { whiteboard: {
             revision: config.getWhiteboardRevision(),
             summary: config.getWhiteboardSummary()
-          }
+          } } : {})
         };
       }
     });
@@ -191,20 +271,56 @@ export function useInterviewAgent() {
       name: "record_interview_evidence",
       description: "Persist a concrete rubric-relevant observation. Never record personality, accent, emotion or appearance judgments.",
       parameters: z.object({
-        category: z.enum(["problem_understanding", "approach", "communication", "correctness", "complexity", "debugging"]),
+        category: z.string().min(1).max(100),
         observation: z.string().min(5),
         confidence: z.number().min(0).max(1)
       }),
       async execute(input) {
-        const response = await fetch("/api/interview/evidence", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...input, sessionId: config.sessionId, codeRevision: config.getCodeRevision() })
+        const rubricIDs = new Set(config.guide.rubric.criteria.map((criterion) => criterion.id));
+        if (!rubricIDs.has(input.category)) throw new Error("Evidence category is not part of the prepared rubric.");
+        const observation: Observation = {
+          observer: "interviewer",
+          areaId: input.category,
+          finding: input.observation,
+          confidence: input.confidence,
+          codeRevision: config.getCodeRevision(),
+          whiteboardRevision: config.getWhiteboardRevision(),
+          at: Date.now()
+        };
+        const payload = buildEvidenceRequest({
+          sessionId: config.sessionId,
+          category: observation.areaId,
+          observation: `[${observation.observer}] ${observation.finding}`,
+          confidence: observation.confidence,
+          codeRevision: observation.codeRevision,
+          whiteboardRevision: observation.whiteboardRevision
         });
-        if (!response.ok) throw new Error("Evidence could not be saved.");
-        return { saved: true };
+        const persist = async () => {
+          const response = await fetch("/api/interview/evidence", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: serializeEvidenceRequest(payload)
+          });
+          if (!response.ok) throw new Error((await response.text()).trim() || "Evidence could not be saved.");
+          await config.onObservation(observation);
+        };
+        try {
+          await persist();
+          return { saved: true };
+        } catch (error) {
+          const message = errorMessage(error);
+          config.onEvidenceError(message, persist);
+          throw new Error(message);
+        }
       }
     });
+
+    const codeEnabled = config.guide.interview.workspaces.includes("code_editor");
+    const whiteboardEnabled = config.guide.interview.workspaces.includes("whiteboard");
+    const workspaceTools = [
+      ...(codeEnabled ? [getCurrentCode, getExecutionResults] : []),
+      ...((codeEnabled || whiteboardEnabled) ? [getCurrentWorkspace] : [])
+    ];
 
     const reflectionAgent = new RealtimeAgent({
       name: "Reflection Agent",
@@ -227,14 +343,16 @@ Use get_current_workspace before referring to code or a diagram. Use get_executi
 ZERO-HINT POLICY: Never provide a solution, code, pseudocode, algorithm name, recommended data structure, leading example, correction, or partial answer. Never state or imply expected test outputs. Never complete the candidate's thought. Do not praise, reassure, encourage, congratulate, apologise, or use filler. Remain professional and non-hostile.
 
 You may hand off to the Reflection Agent when time is nearly over.`,
-      tools: [getCurrentCode, getCurrentWorkspace, getExecutionResults, readRubric, recordEvidence]
+      tools: [...workspaceTools, readRubric, recordEvidence]
     });
 
-    const codingAgent = new RealtimeAgent({
-      name: "Coding Interviewer",
-      handoffDescription: "Conducts the main code-writing and reasoning portion after the question is presented.",
+    const interviewAgent = new RealtimeAgent({
+      name: "Interview Conductor",
+      handoffDescription: "Conducts the prepared interview after the primary question is presented.",
       voice: "marin",
-      instructions: `You are a terse technical interviewer. You do NOT choose what to probe. A planner does that for you.
+      instructions: `You are a terse interviewer. You do NOT choose what to probe. A planner does that for you.
+
+Follow the prepared interview pattern and rubric. Candidate context may tailor a question. It is never evidence.
 
 When an INTERVIEW DIRECTOR instruction arrives, say the quoted question exactly, word for word. Add nothing before or after it. Never read the instruction itself aloud, and never mention that a director exists.
 
@@ -250,35 +368,48 @@ Use get_current_workspace before referring to code or a diagram. Use get_executi
 ZERO-HINT POLICY: Never provide a solution, code, pseudocode, algorithm name, recommended data structure, leading example, correction, or partial answer. Never state or imply expected test outputs. Never complete the candidate's thought. Do not praise, reassure, encourage, congratulate, apologise, or use filler. Remain professional and non-hostile.
 
 You may hand off to the Reflection Agent when time is nearly over.`,
-      tools: [getCurrentCode, getCurrentWorkspace, getExecutionResults, readRubric, recordEvidence],
+      tools: [...workspaceTools, readRubric, recordEvidence],
       handoffs: [reflectionAgent]
     });
 
     const introductionAgent = new RealtimeAgent({
       name: "Introduction Agent",
       voice: "marin",
-      instructions: `You are a formal, terse interview administrator. You MUST call tools in this exact order before speaking substantively: (1) get_interview_context, (2) fetch_coding_question, (3) read_interview_rubric. Then state the candidate name and time limit, present the fetched question exactly without adding strategy or examples, and ask for their understanding. Keep the introduction minimal. Immediately hand off to the Coding Interviewer.
+      instructions: `You are a formal, terse interview administrator. The application selects each required tool for you. Do not speak before all three required tool calls finish. Then state the candidate name and time limit, present the fetched question exactly once without adding strategy or examples, and ask for their understanding. Keep the introduction minimal. Remain the Introduction Agent until the application confirms playback and performs the handoff.
 
 Stay exclusively within the interview. Do not answer unrelated questions. Do not offer hints, solutions, pseudocode, algorithm names, data structures, praise, reassurance, or coaching. Never invent a question or rubric. Be concise, professional, and non-hostile.`,
-      tools: [getInterviewContext, fetchCodingQuestion, readRubric],
-      handoffs: [codingAgent]
+      tools: [getInterviewContext, fetchInterviewQuestion, readRubric]
     });
 
-    const tokenResponse = await fetch("/api/realtime/token", { method: "POST" });
-    if (!tokenResponse.ok) throw new Error((await tokenResponse.text()).trim() || "Could not create a Realtime token.");
-    const token = await tokenResponse.json() as { value?: string; model?: string };
-    if (!token.value) throw new Error("Realtime token response was invalid.");
-    if (!token.model) throw new Error("Realtime token model was missing.");
+    let token = tokenCacheRef.current?.sessionId === config.sessionId ? tokenCacheRef.current : null;
+    if (!token) {
+      const tokenResponse = await fetch("/api/realtime/token", { method: "POST" });
+      if (!tokenResponse.ok) throw new Error((await tokenResponse.text()).trim() || "Could not create a Realtime token.");
+      const body = await tokenResponse.json() as { value?: string; model?: string };
+      if (!body.value) throw new Error("Realtime token response was invalid.");
+      if (!body.model) throw new Error("Realtime token model was missing.");
+      token = { sessionId: config.sessionId, value: body.value, model: body.model };
+      tokenCacheRef.current = token;
+    }
 
     const transport = new OpenAIRealtimeWebRTC({ mediaStream: config.media });
     const session = new RealtimeSession(introductionAgent, {
       transport,
       model: token.model,
-      workflowName: "Automated Coding Interview",
+      workflowName: "Automated Interview",
       groupId: config.sessionId,
       traceMetadata: { sessionId: config.sessionId, role: config.role },
-      outputGuardrails: [zeroHintGuardrail],
+      outputGuardrails: [
+        zeroHintGuardrailWithApprovedQuestion(
+          config.guide.question.prompt,
+          () => deliveryTrackerRef.current?.isPendingQuestion(config.guide.question.prompt) === true
+        )
+      ],
       config: {
+        // Connection is speech-safe and unforced. begin() applies the first exact
+        // tool choice and waits for its server acknowledgement before responding.
+        toolChoice: "auto",
+        parallelToolCalls: false,
         ...(config.voiceEnabled ? {} : { outputModalities: ["text"] as const }),
          audio: {
            input: {
@@ -289,13 +420,45 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
       }
     });
     sessionRef.current = session;
+    const bootstrapAdapter = createRealtimeBootstrapAdapter<RealtimeAgent>({
+      updateToolChoice: async (choice) => {
+        // Rebuild the complete config so a phase change cannot reset audio,
+        // instructions, tools, or parallel-call settings to transport defaults.
+        const nextConfig = await session.getInitialSessionConfig(realtimeToolChoiceOverride(choice));
+        session.transport.updateSessionConfig(nextConfig);
+      },
+      onTransportEvent: (listener) => {
+        const onEvent = (event: unknown) => listener(event);
+        session.on("transport_event", onEvent);
+        return () => session.off("transport_event", onEvent);
+      },
+      requestResponse: () => {
+        if (session.transport.requestResponse) session.transport.requestResponse();
+        else session.transport.sendEvent({ type: "response.create" });
+      },
+      updateAgent: (agent) => session.updateAgent(agent),
+      removeHistoryItem: (itemId) => session.updateHistory((history) => history.filter((item) => item.itemId !== itemId)),
+      close: () => session.close()
+    });
+    bootstrapRef.current = createRealtimeBootstrapLifecycle({
+      adapter: bootstrapAdapter,
+      approvedQuestion: config.guide.question.prompt,
+      conductor: interviewAgent,
+      timeoutMs: 20_000,
+      onHandoff: () => setActiveAgent(interviewAgent.name),
+      onDelivered: (question, at) => {
+        session.mute(requestedMutedRef.current);
+        askedQuestionsRef.current = [...askedQuestionsRef.current, question];
+        signalBusRef.current?.notifyQuestionDelivered(at);
+        config.onQuestionDelivered(question, at);
+      }
+    });
     session.on("agent_start", () => updateStatus("thinking"));
     session.on("agent_end", () => { if (!endingRef.current) updateStatus("listening"); });
     session.on("audio_start", () => { if (endingRef.current) closingAudioRef.current = true; updateStatus(endingRef.current ? "ending" : "speaking"); });
-    session.on("audio_stopped", () => {
-      if (endingRef.current && closingAudioRef.current) closeNow(endingReasonRef.current);
-      else if (!endingRef.current) updateStatus("listening");
-    });
+    // SDK audio_stopped marks response audio generation, not WebRTC playback.
+    // Delivery and closing wait for raw output_audio_buffer.stopped below.
+    session.on("audio_stopped", () => undefined);
     session.on("audio_interrupted", () => { if (!endingRef.current) updateStatus("listening"); });
     session.on("agent_handoff", (_context, _from, to) => setActiveAgent(to.name));
     session.on("agent_tool_start", (_context, _agent, calledTool) => {
@@ -307,42 +470,60 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
       config.onActivity({ type: "tool", text: `${calledTool.name} · complete`, at: Date.now() });
     });
     session.on("transport_event", (event: any) => {
+      const responseId = String(event?.response_id ?? event?.response?.id ?? "");
+      const itemId = String(event?.item_id ?? "");
+      if (responseId && itemId) deliveryTrackerRef.current?.associateItem(responseId, itemId);
+      const playbackResponseId = realtimePlaybackStoppedResponse(event);
+      if (playbackResponseId) {
+        transcriptStoreRef.current?.commitAssistantHistory();
+        deliveryTrackerRef.current?.confirmCompleted(playbackResponseId, Date.now());
+        if (endingRef.current && closingAudioRef.current) closeNow(endingReasonRef.current);
+        else if (!endingRef.current) updateStatus("listening");
+        return;
+      }
+      if (event?.type === "response.created") {
+        deliveryTrackerRef.current?.associateResponse(String(event.response?.id ?? ""));
+        return;
+      }
+      if (event?.type === "response.done") {
+        const completedResponseId = String(event.response?.id ?? "");
+        for (const output of Array.isArray(event.response?.output) ? event.response.output : []) {
+          const outputId = String(output?.id ?? "");
+          if (outputId) deliveryTrackerRef.current?.associateItem(completedResponseId, outputId);
+        }
+        const containsPrimaryQuestion = deliveryTrackerRef.current?.completeResponse(completedResponseId, realtimeResponseText(event)) === true;
+        if (containsPrimaryQuestion && !config.voiceEnabled) {
+          transcriptStoreRef.current?.commitAssistantHistory();
+          deliveryTrackerRef.current?.confirmCompleted(completedResponseId, Date.now());
+        }
+        return;
+      }
       if (event?.type !== "conversation.item.input_audio_transcription.completed") return;
-      if (!event.transcript || seenTranscriptItemsRef.current.has(event.item_id)) return;
-      seenTranscriptItemsRef.current.add(event.item_id);
-      const turn: TranscriptTurn = { role: "candidate", text: String(event.transcript).trim(), at: Date.now() };
-      transcriptRef.current = [...transcriptRef.current, turn];
-      config.onTranscriptTurn?.(turn);
+      transcriptStoreRef.current?.addCandidate(String(event.item_id ?? ""), String(event.transcript ?? ""), Date.now());
     });
     session.on("history_updated", (history: any[]) => {
-      for (const item of history) {
-        if (item?.type !== "message" || item?.role !== "assistant") continue;
-        const itemId = String(item.itemId ?? item.id ?? "");
-        if (!itemId || seenTranscriptItemsRef.current.has(itemId)) continue;
-        const text = (item.content ?? [])
-          .map((part: any) => part?.transcript ?? part?.text ?? "")
-          .join(" ")
-          .trim();
-        if (!text) continue;
-        seenTranscriptItemsRef.current.add(itemId);
-        const turn: TranscriptTurn = { role: "interviewer", text, at: Date.now() };
-        transcriptRef.current = [...transcriptRef.current, turn];
-        config.onTranscriptTurn?.(turn);
-      }
+      transcriptStoreRef.current?.syncAssistantHistory(history, Date.now());
     });
-    session.on("guardrail_tripped", (_context, _agent, details) => {
-      config.onActivity({ type: "guardrail", text: `zero_hint blocked: ${JSON.stringify(details)}`, at: Date.now() });
+    session.on("guardrail_tripped", (_context, _agent, guardrailError, details) => {
+      const blocked = realtimeGuardrailIdentity(guardrailError, details);
+      transcriptStoreRef.current?.rejectAssistantItem(blocked.itemId);
+      deliveryTrackerRef.current?.rejectItem(blocked.itemId);
+      if (blocked.itemId) bootstrapAdapter.removeHistoryItem(blocked.itemId);
+      config.onActivity({ type: "guardrail", text: `${blocked.name} blocked item ${blocked.itemId || "unknown"}`, at: Date.now() });
     });
     session.on("error", (event) => { setError(errorMessage(event)); updateStatus("error"); });
     await session.connect({ apiKey: token.value, model: token.model });
+    session.mute(true);
     updateStatus("listening");
-    session.sendMessage("Begin the interview now. Follow the mandatory introduction tool sequence before presenting the question.");
     observationsRef.current = [];
     askedQuestionsRef.current = [];
-    transcriptRef.current = [];
-    seenTranscriptItemsRef.current = new Set();
     whiteboardImageCacheRef.current = null;
-    stopSignalBusRef.current = startSignalBus({
+    const commitPlannerObservation = (observation: Observation) => {
+      if (observationsRef.current.includes(observation)) return;
+      observationsRef.current = [...observationsRef.current, observation];
+      config.onObservation(observation);
+    };
+    signalBusRef.current = startSignalBus({
       getCode: config.getCode,
       getCodeRevision: config.getCodeRevision,
       getCodeChangedAt: config.getCodeChangedAt,
@@ -352,33 +533,45 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
       getLastRun: config.getLastRun,
       getRemainingSeconds: config.getRemainingSeconds,
       getElapsedSeconds: config.getElapsedSeconds,
-      getAgentStatus: () => statusRef.current,
+      getAgentStatus: () => deliveryTrackerRef.current?.hasPending() ? "thinking" : statusRef.current,
       getQuestion: config.getQuestionText,
       getRubric: config.getRubric,
       getPlan: config.getPlan,
-      getTranscript: () => transcriptRef.current,
+      getTranscript: () => transcriptStoreRef.current?.turns() ?? [],
       getAskedQuestions: () => askedQuestionsRef.current,
       getObservations: () => observationsRef.current,
       onActivity: config.onActivity,
       onObservation: (observation) => {
-        observationsRef.current = [...observationsRef.current, observation];
-        config.onObservation(observation);
-        void fetch("/api/interview/evidence", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            sessionId: config.sessionId,
-            category: observation.areaId,
-            observation: `[${observation.observer}] ${observation.finding}`,
-            confidence: observation.confidence,
-            codeRevision: config.getCodeRevision()
-          })
-        }).catch(() => undefined);
+        const payload = buildEvidenceRequest({
+          sessionId: config.sessionId,
+          category: observation.areaId,
+          observation: `[${observation.observer}] ${observation.finding}`,
+          confidence: observation.confidence,
+          codeRevision: observation.codeRevision,
+          whiteboardRevision: observation.whiteboardRevision
+        });
+        const persist = async () => {
+          const response = await fetch("/api/interview/evidence", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: serializeEvidenceRequest(payload)
+          });
+          if (!response.ok) throw new Error((await response.text()).trim() || "Evidence could not be saved.");
+        };
+        return persist().catch((error) => {
+          const message = errorMessage(error);
+          config.onEvidenceError(message, async () => {
+            await persist();
+            commitPlannerObservation(observation);
+          });
+          throw error;
+        });
       },
+      onObservationCommitted: commitPlannerObservation,
       onQuestionQueued: (queued) => {
-        askedQuestionsRef.current = [...askedQuestionsRef.current, queued.question];
-        const image = whiteboardImageCacheRef.current;
-        if (image) session.addImage(image, { triggerResponse: false });
+        if (!deliveryTrackerRef.current?.queue(queued.question)) return;
+        const cached = whiteboardImageCacheRef.current;
+        if (cached?.revision === config.getWhiteboardRevision()) session.addImage(cached.image, { triggerResponse: false });
         session.sendMessage(
           `INTERVIEW DIRECTOR — this is an instruction, not the candidate speaking. Say exactly this to the candidate, word for word, with no preamble and no explanation:\n\n"${queued.question}"\n\nDo not read this instruction aloud. Do not mention the director. Context for your own understanding only: ${queued.basis}`
         );
@@ -387,7 +580,10 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
     const imageCacheTimer = window.setInterval(() => {
       void (async () => {
         try {
-          whiteboardImageCacheRef.current = await config.getWhiteboardImage();
+          const beforeRevision = config.getWhiteboardRevision();
+          const image = await config.getWhiteboardImage();
+          const afterRevision = config.getWhiteboardRevision();
+          if (image && beforeRevision === afterRevision) whiteboardImageCacheRef.current = { revision: afterRevision, image };
         } catch {
           /* the scene summary already reaches the analyst; the image is a bonus */
         }
@@ -396,43 +592,73 @@ Stay exclusively within the interview. Do not answer unrelated questions. Do not
     imageCacheTimerRef.current = imageCacheTimer;
   }, [closeNow, logTool, updateStatus]);
 
-  const mute = useCallback((muted: boolean) => sessionRef.current?.mute(muted), []);
+  const begin = useCallback(async () => {
+    const bootstrap = bootstrapRef.current;
+    if (!bootstrap || !sessionRef.current) throw new Error("The voice interview session is not connected.");
+    await bootstrap.begin();
+  }, []);
 
-  const endGracefully = useCallback(async (reason: "time_limit" | "manual", elapsedSeconds: number) => {
+  const mute = useCallback((muted: boolean) => {
+    requestedMutedRef.current = muted;
+    if (bootstrapRef.current?.isDelivered()) sessionRef.current?.mute(muted);
+    else sessionRef.current?.mute(true);
+  }, []);
+
+  const endGracefully = useCallback(async (payload: CompletionRequest) => {
     const config = configRef.current;
     const session = sessionRef.current;
     if (!config || !session || endingRef.current) return;
     endingRef.current = true;
-    endingReasonRef.current = reason;
+    endingReasonRef.current = payload.reason;
     closingAudioRef.current = false;
+    const completingBootstrap = bootstrapRef.current?.cancelForCompletion() === true;
     updateStatus("ending");
-    stopSignalBusRef.current?.();
-    stopSignalBusRef.current = null;
+    signalBusRef.current?.stop();
+    signalBusRef.current = null;
     if (imageCacheTimerRef.current !== null) window.clearInterval(imageCacheTimerRef.current);
     imageCacheTimerRef.current = null;
     try { session.mute(true); } catch { /* transport may already be closing */ }
     session.interrupt();
-    await fetch("/api/interview/complete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId: config.sessionId, reason, elapsedSeconds })
-    }).catch(() => undefined);
-    session.sendMessage(reason === "time_limit"
+    try {
+      await postCompletionRequest(payload);
+    } catch (error) {
+      endingRef.current = false;
+      updateStatus("listening");
+      config.onCompletionError(errorMessage(error));
+      return;
+    }
+    if (completingBootstrap || bootstrapRef.current?.isDelivered() !== true) {
+      closeNow(payload.reason);
+      return;
+    }
+    session.sendMessage(payload.reason === "time_limit"
       ? "The interview time limit has been reached. State only that time is up and the interview is complete. Do not summarize performance, praise the candidate, provide answers, or ask another question."
       : "The candidate has ended the interview. State only that the interview is complete. Do not summarize performance, praise the candidate, provide answers, or ask another question.");
-    endFallbackRef.current = window.setTimeout(() => closeNow(reason), 10000);
+    endFallbackRef.current = window.setTimeout(() => closeNow(payload.reason), 10000);
   }, [closeNow, updateStatus]);
 
-  const disconnect = useCallback(() => {
+  const disconnect = useCallback((preserveStartup = false) => {
+    closedInterviewRef.current = true;
     endingRef.current = false;
-    stopSignalBusRef.current?.();
-    stopSignalBusRef.current = null;
+    if (endFallbackRef.current !== null) window.clearTimeout(endFallbackRef.current);
+    endFallbackRef.current = null;
+    signalBusRef.current?.stop();
+    signalBusRef.current = null;
     if (imageCacheTimerRef.current !== null) window.clearInterval(imageCacheTimerRef.current);
     imageCacheTimerRef.current = null;
-    sessionRef.current?.close();
+    const bootstrap = bootstrapRef.current;
+    bootstrap?.stop();
+    if (bootstrap) bootstrap.close();
+    else sessionRef.current?.close();
+    bootstrapRef.current = null;
     sessionRef.current = null;
+    if (!preserveStartup) tokenCacheRef.current = null;
+    configRef.current = null;
+    transcriptStoreRef.current = null;
+    deliveryTrackerRef.current?.reset();
+    deliveryTrackerRef.current = null;
     updateStatus("idle");
   }, [updateStatus]);
 
-  return { status, error, activeAgent, toolEvents, connect, mute, endGracefully, disconnect, getTranscript: () => transcriptRef.current };
+  return { status, error, activeAgent, toolEvents, connect, begin, mute, endGracefully, disconnect, getTranscript: () => transcriptStoreRef.current?.turns() ?? [] };
 }

@@ -1,8 +1,8 @@
 import type { OnMount } from "@monaco-editor/react";
+import { getTypeScriptWorker } from "monaco-editor/language/typescript/monaco.contribution.js";
 import type { QuestionTest, RunResult, WorkerInbound, WorkerOutbound } from "./types";
 
 type EditorInstance = Parameters<OnMount>[0];
-type MonacoInstance = Parameters<OnMount>[1];
 type TextModel = NonNullable<ReturnType<EditorInstance["getModel"]>>;
 
 type TsDiagnostic = {
@@ -31,17 +31,16 @@ function createWorker() {
 }
 
 export async function runCode(options: {
-  monaco: MonacoInstance;
   model: TextModel;
   entryFunction: string;
   tests: QuestionTest[];
   codeRevision: number;
 }): Promise<RunResult> {
-  const { monaco, model, entryFunction, tests, codeRevision } = options;
+  const { model, entryFunction, tests, codeRevision } = options;
   const ranAt = Date.now();
   const uri = model.uri.toString();
 
-  const getWorker = await monaco.languages.typescript.getTypeScriptWorker();
+  const getWorker = await getTypeScriptWorker();
   const client = (await getWorker(model.uri)) as TsWorkerClient;
   const syntactic = await client.getSyntacticDiagnostics(uri);
 

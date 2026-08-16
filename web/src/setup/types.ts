@@ -1,6 +1,5 @@
 export type InterviewType = "coding" | "system_design" | "behavioral" | "mixed";
 export type WorkspaceOption = "code_editor" | "whiteboard";
-export type ToolOption = "ai_chat";
 export type ChannelOption = "voice";
 
 export type RubricCriterionDraft = {
@@ -19,7 +18,6 @@ export type InterviewSetupDraft = {
   codingLanguage: string;
   questionTypes: string[];
   workspaces: WorkspaceOption[];
-  tools: ToolOption[];
   channels: ChannelOption[];
   briefText: string;
   briefFile: File | null;
@@ -38,11 +36,10 @@ export const DEFAULT_SETUP_DRAFT: InterviewSetupDraft = {
   roleTitle: "Software Engineer",
   roleLevel: "Mid-level",
   interviewType: "coding",
-  durationMinutes: 30,
+  durationMinutes: 5,
   codingLanguage: "TypeScript",
   questionTypes: ["problem_solving", "debugging", "complexity"],
   workspaces: ["code_editor", "whiteboard"],
-  tools: [],
   channels: ["voice"],
   briefText: "Run a focused technical interview for the selected role.",
   briefFile: null,
@@ -87,6 +84,19 @@ export const DEFAULT_SETUP_DRAFT: InterviewSetupDraft = {
   reviewedFacts: ""
 };
 
+export function compatibleInterviewDefaults(type: InterviewType): Pick<InterviewSetupDraft, "codingLanguage" | "questionTypes" | "workspaces"> {
+  if (type === "behavioral") return { codingLanguage: "", questionTypes: ["behavioral"], workspaces: [] };
+  if (type === "system_design") return { codingLanguage: "", questionTypes: ["system_design", "complexity"], workspaces: ["whiteboard"] };
+  if (type === "mixed") return { codingLanguage: "TypeScript", questionTypes: ["problem_solving", "system_design", "complexity"], workspaces: ["code_editor", "whiteboard"] };
+  return { codingLanguage: "TypeScript", questionTypes: ["problem_solving", "debugging", "complexity"], workspaces: ["code_editor", "whiteboard"] };
+}
+
+export function compatibleQuestionTypes(type: InterviewType, values: string[]) {
+  if (type === "behavioral") return values.filter((value) => value === "behavioral");
+  if (type === "system_design") return values.filter((value) => value === "system_design" || value === "complexity" || value === "behavioral");
+  return values;
+}
+
 export function formatRubricForAgent(draft: InterviewSetupDraft) {
   const criteria = draft.rubricCriteria
     .map((criterion) => `- ${criterion.name} (${criterion.weight}%): ${criterion.expectedEvidence}`)
@@ -118,18 +128,9 @@ function isHttpsUrl(value: string) {
 export function setupStepError(draft: InterviewSetupDraft, step: number): string | null {
   if (step === 0) {
     if (!draft.candidateName.trim()) return "Enter the candidate's name.";
-    if (!draft.roleTitle.trim()) return "Enter the target role.";
-    if (!draft.roleLevel.trim()) return "Enter the seniority level.";
   }
   if (step === 1) {
     if (draft.durationMinutes < 1 || draft.durationMinutes > 120) return "Set a duration between 1 and 120 minutes.";
-    if (draft.questionTypes.length === 0) return "Select at least one question type.";
-    if ((draft.interviewType === "coding" || draft.interviewType === "mixed") && !draft.codingLanguage.trim()) {
-      return "Enter a coding language for this interview type.";
-    }
-  }
-  if (step === 2 && !draft.briefText.trim() && !draft.briefFile) {
-    return "Add an interview brief as text or a file.";
   }
   if (step === 2) {
     const invalidFile = fileError(draft.briefFile, "Interview brief") || fileError(draft.resumeFile, "Résumé");
@@ -141,7 +142,7 @@ export function setupStepError(draft: InterviewSetupDraft, step: number): string
   if (step === 3) {
     const invalidFile = fileError(draft.rubricFile, "Rubric file");
     if (invalidFile) return invalidFile;
-    if (draft.rubricCriteria.length === 0) return "Add at least one rubric criterion.";
+    if (draft.rubricCriteria.length === 0) return null;
     const incomplete = draft.rubricCriteria.some(
       (criterion) => !criterion.id.trim() || !criterion.name.trim() || !criterion.expectedEvidence.trim()
     );

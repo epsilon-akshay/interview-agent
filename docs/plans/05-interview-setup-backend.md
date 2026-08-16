@@ -1,65 +1,72 @@
 # Interview Setup Backend v1
 
-## Setup-ID lifecycle
+Status: implemented.
 
-1. The setup UI creates one 32-character lowercase hexadecimal `setupId` before uploading files.
-2. Every upload sends the same `setupId` in multipart form data.
-3. The UI sends the completed `InterviewSetup` snapshot with that `setupId`.
-4. The server saves the snapshot once. A second write for the same ID returns `409 Conflict`.
-5. The UI reuses `setupId` as the interview session ID, so a later conducting-layer integration can load the snapshot without another identifier.
+## Setup ID and retry lifecycle
 
-The current interview-conducting layer receives the ID as its existing session ID. It does not read the setup API yet.
+1. The browser creates one 32-character lowercase-hex `setupId` before its first upload or setup request.
+2. Every upload sends that ID.
+3. Successful uploads stay in a frontend startup cache.
+4. The browser saves one complete `InterviewSetup` v1 snapshot.
+5. It prepares that saved setup.
+6. It reuses the setup ID as the interview session ID.
+
+A retry keeps the same ID and successful upload, setup, and preparation results. A rollback clears media, recorder, recording URL, and agent state. It does not discard completed setup phases.
 
 ## API
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `POST` | `/api/interview/uploads` | Store one setup file. Requires `setupId`, `kind`, `file`, and `candidateSourceType` for candidate files. |
-| `POST` | `/api/interview/setups` | Validate and save one `InterviewSetup` v1 snapshot. |
-| `GET` | `/api/interview/setups/{id}` | Read one saved snapshot. |
+| `POST` | `/api/interview/uploads` | Store one private setup file |
+| `POST` | `/api/interview/setups` | Validate and save one immutable setup snapshot |
+| `GET` | `/api/interview/setups/{id}` | Read one saved snapshot |
+| `POST` | `/api/interview/setups/{id}/prepare` | Create or read one prepared guide |
 
-The server stores files under `runtime/setups/{setupId}/uploads/`. It stores the snapshot at `runtime/setups/{setupId}/setup.json`.
+Browser mutation requests must use the same origin. Unknown API routes return `404`.
 
-## Contract
+## Setup contract
 
-The snapshot includes its `setupId`, `version: 1`, and the fixed `candidateContextPolicy` value `job_related_question_tailoring_only`.
+The snapshot includes:
 
-It also includes candidate sources and reviewed facts, role, interview settings, brief, and a structured rubric. Interview settings separate workspaces, candidate tools, and interview channels. AI chat uses `tools: ["ai_chat"]`. Voice uses `channels: ["voice"]`. Interview types are `coding`, `system_design`, `behavioral`, or `mixed`. A resume can use `upload:{uploadId}`. LinkedIn, GitHub, and website sources must use HTTPS URLs. The API does not fetch those URLs.
+- `setupId` and `version: 1`
+- `candidateContextPolicy: "job_related_question_tailoring_only"`
+- candidate sources and reviewed facts
+- role and interview settings
+- brief text and attachments
+- structured rubric criteria
 
-The brief requires text or an attachment. A rubric can include structured criteria, optional `sourceText`, and source attachments. Rubric weights total 100.
+Interview settings separate workspaces and channels. v1 candidate tools are empty. Voice uses the voice channel. Code-editor interviews use TypeScript. Behavioral interviews cannot keep coding language or code workspace defaults.
 
-Candidate information only tailors job-related questions. It does not change rubric weights or count as interview evidence.
+Candidate information can tailor job-related questions. It cannot change rubric weights or become interview evidence.
 
-## Validation and storage
+## Upload rules
 
-- JSON payloads cap at 256 KB. Uploads cap at 10 MB and cannot be empty.
-- File extensions allow PDF, TXT, Markdown, JSON, and DOCX. File bytes must match the extension. The server checks PDF and DOCX signatures, valid UTF-8 text, and valid JSON. It stores a canonical content type.
-- Attachment IDs must be unique, exist under the same setup ID, and match their allowed purpose.
-- Setup writes use a temporary file and atomic rename.
+- Uploads cap at 10 MB and cannot be empty.
+- Allowed files are PDF, TXT, Markdown, JSON, and DOCX.
+- File bytes must match the extension.
+- Attachment IDs must belong to the same setup and allowed purpose.
+- LinkedIn, GitHub, and website sources must use HTTPS. The server does not fetch them.
 
-This is local-demo storage. External use needs authenticated access, tenant checks, retention controls, malware scanning, and durable storage.
+## Idempotency
 
-## Implementation plan
+- The first setup snapshot returns `201`.
+- An identical retry returns `200`.
+- A different snapshot for the same ID returns `409`.
+- The first prepared guide returns `201`.
+- An identical preparation retry returns `200`.
+- A preparation-mode conflict returns `422`.
 
-[P1] Define the boundary
+## Storage
 
-- ✎ [P1.1] Write the v1 setup contract and lifecycle · record fields, validation, and current non-integration boundary · 15m · produces the contract section → feeds [P2.1]
-- ✎ [P1.2] Define candidate-context policy · state allowed question tailoring and scoring exclusions · 10m · produces the policy field and rule → feeds [P2.1]
+```text
+runtime/setups/{setupId}/
+├── setup.json
+├── prepared.json
+└── uploads/
+```
 
-[P2] Build private persistence
+Writes use temporary files and atomic rename. Runtime directories and private files use owner-only permissions before writes.
 
-- ✎ [P2.1] Add setup create and read handlers · validate the v1 snapshot and save an immutable setup file · 20m · produces setup endpoints → feeds [P3.1]
-- ✎ [P2.2] Add setup-scoped upload handler · validate purpose, source type, filename, size, bytes, and metadata · 20m · produces private attachment storage → feeds [P3.1]
-- ✎ [P2.3] Add atomic file writes · write temporary JSON then rename it into place · 10m · produces durable setup and metadata writes → feeds [P3.1]
+## Deployment boundary
 
-[P3] Enforce references and prove behavior
-
-- ☐ [P3.1] Validate every attachment reference · read attachment metadata and require the same setup and purpose · 15m · produces scoped-reference validation → feeds [P3.2]
-- → [P3.2] Add handler regression tests · cover malformed JSON, source boundaries, file signatures, cross-setup access, and duplicate writes · 20m · produces test coverage → feeds [P4.1]
-
-[P4] Verify and document
-
-- ✎ [P4.1] Update API documentation · add endpoints, storage paths, and non-consumption statement · 10m · produces updated boundary docs → feeds [P4.2]
-- → [P4.2] Run repository checks · run formatting, Go tests, frontend type checks, and diff validation · 15m · produces verification output → DONE
-
-Critical path: P1.1 + P1.2 → P2.1 + P2.2 + P2.3 → P3.1 → P3.2 → P4.1 → P4.2. P2.1, P2.2, and P2.3 can run in parallel after P1.
+The app defaults to `127.0.0.1:8080`. A non-loopback key-bearing server needs the explicit unsafe bind flag. Public use still needs authentication, tenant checks, malware scanning, retention controls, and durable storage.

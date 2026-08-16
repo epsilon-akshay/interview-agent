@@ -1,6 +1,10 @@
 web/node_modules/
+web/tests/.compiled/
 bin/
+/server
 runtime/
 .env
 .DS_Store
 .cache/
+output/
+web/test-results/
